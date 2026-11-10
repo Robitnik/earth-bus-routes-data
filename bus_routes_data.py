@@ -37,7 +37,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 APP = "earth-bus-routes-data"
 PORT = 47630
 UA = f"{APP}/{VERSION} (+https://github.com/Robitnik/earth-bus-routes)"   # Overpass refuses clients without one
@@ -765,9 +765,19 @@ def make_handler(service, port):
     return Handler
 
 
+class QuietServer(ThreadingHTTPServer):
+    """A client that gives up while the answer is being sent (the game cancels a request, a page is closed) is not an error: the
+    default handler prints a traceback to stderr, which BeamNG.Earth's Add-ons page shows as "stopped with an error"."""
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def serve(port=PORT, cache_dir=None, service=None):
     service = service or Service(Cache(cache_dir or default_cache_dir()))
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(service, port))
+    httpd = QuietServer(("127.0.0.1", port), make_handler(service, port))
     httpd.daemon_threads = True
     say(f"{APP} {VERSION} listening on 127.0.0.1:{port}, cache {service.cache.dir}")
     threading.Thread(target=service.load_index, daemon=True).start()
