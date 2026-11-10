@@ -11,7 +11,9 @@ bus stops and bus routes the mod wants, keeps the answers on disk and hands them
   GET /v1/path?pts=lat,lon;lat,lon;..   the road route through 2..25 points (OSRM): {points, legs, dist, dur, source}
   GET /v1/along?pts=...                 the bus stops within 30 m of that road route
   GET /v1/stations?lat=..&lon=..        the bus stations within 25 km of a point
-  GET /v1/search?q=..&lat=..&lon=..     stations and stops by name within 40 km of a point
+  GET /v1/search?q=..&lat=..&lon=..     stations and stops by name within 40 km of a point (&local=1: only what this service
+                                        has already seen, answered at once)
+  GET /v1/lines?ref=..&lat=..&lon=..    the bus lines with this number within 40 km (&local=1 likewise)
   GET /v1/status                        what it did lately (for the Add-ons page's log)
 
 Every answer is {"ok": true, "cached": bool, "data": <Overpass JSON>} or {"ok": false, "error": "..."}.
@@ -28,13 +30,14 @@ import pathlib
 import re
 import sys
 import threading
+import unicodedata
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 APP = "earth-bus-routes-data"
 PORT = 47630
 UA = f"{APP}/{VERSION} (+https://github.com/Robitnik/earth-bus-routes)"   # Overpass refuses clients without one
@@ -52,7 +55,7 @@ BACKOFF_S = (1.0, 3.0, 8.0)
 TIMEOUT_S = 45                   # a public server that takes longer is overloaded: try the next one
 MAX_BYTES = 12 * 1024 * 1024
 MODES = "^(bus|trolleybus|minibus|share_taxi)$"
-FEATURES = ["path", "along", "search", "stations"]
+FEATURES = ["path", "along", "search", "stations", "local", "lines"]
 STATIONS_M = 25000
 STATIONS_CELL_DEG = 0.05
 OSRM = ["https://router.project-osrm.org", "https://routing.openstreetmap.de/routed-car"]
@@ -377,6 +380,135 @@ def search_key(text, lat, lon):
     return "search_" + h
 
 
+# ---- the index of everything seen so far (instant searches) ---------------------------------------------------------------
+
+_FOLD_EXTRA = str.maketrans({"\u0142": "l", "\u0141": "l", "\u0111": "d", "\u0110": "d", "\u00f8": "o", "\u00d8": "o", "\u00df": "ss",
+                             "\u0131": "i", "\u00e6": "ae", "\u0153": "oe"})
+
+
+def fold(text):
+    """Lower case without accents: "N\u00e1chod" and "nachod" are the same."""
+    t = unicodedata.normalize("NFKD", str(text or "")).translate(_FOLD_EXTRA)
+    return "".join(c for c in t if not unicodedata.combining(c)).casefold()
+
+
+def anchor_of(key):
+    """(lat, lon) a cache key names ("near3_50.216_15.814", "lines_305_50.4_16.2"), else None."""
+    m = re.search(r"_(-?\d+\.\d+)_(-?\d+\.\d+)(?:\.json)?$", key)
+    return (float(m.group(1)), float(m.group(2))) if m else None
+
+
+def _near(lat, lon, la, lo, radius_m):
+    k = math.cos(math.radians(lat)) * 111320
+    return math.hypot((lo - lon) * k, (la - lat) * 110574) <= radius_m
+
+
+class StopIndex:
+    """The stops, stations and lines of every answer this service has fetched or kept, in memory. A name or a line number is
+    found at once, even offline; the public servers are only asked for what is not known yet."""
+
+    LINE_TAGS = ("ref", "name", "from", "to", "network", "operator", "colour", "route", "public_transport:version")
+
+    def __init__(self):
+        self.stops = {}               # (type, id) -> {id, lat, lon, name, tags}
+        self.lines = {}               # relation id -> {id, tags, anchor}
+        self._lock = threading.Lock()
+
+    def add(self, text, anchor=None):
+        try:
+            data = json.loads(text) if isinstance(text, str) else text
+            elements = data.get("elements", [])
+        except (ValueError, AttributeError):
+            return 0
+        n = 0
+        with self._lock:
+            for e in elements:
+                tags = e.get("tags") or {}
+                t = e.get("type")
+                if t == "relation":
+                    if tags.get("type") == "route" and tags.get("ref") and e.get("id") is not None:
+                        old = self.lines.get(e["id"])
+                        self.lines[e["id"]] = {"id": e["id"], "tags": {k: tags[k] for k in self.LINE_TAGS if k in tags},
+                                               "anchor": anchor or (old or {}).get("anchor")}
+                        n += 1
+                    continue
+                name = tags.get("name")
+                kind = tags.get("amenity") == "bus_station" or tags.get("highway") == "bus_stop" or tags.get("public_transport") in ("platform", "station")
+                if not (name and kind and e.get("id") is not None):
+                    continue
+                lat, lon = e.get("lat"), e.get("lon")
+                if lat is None and e.get("center"):
+                    lat, lon = e["center"].get("lat"), e["center"].get("lon")
+                if lat is None or lon is None:
+                    continue
+                self.stops[(t, e["id"])] = {"id": e["id"], "lat": lat, "lon": lon, "name": name,
+                                            "tags": {k: tags[k] for k in ("name", "amenity", "highway", "public_transport", "bus") if k in tags}}
+                n += 1
+        return n
+
+    def load(self, directory):
+        """Everything in the cache folder (files {"t", "data"}); returns how many entries were indexed."""
+        n = 0
+        for f in pathlib.Path(directory).glob("*.json"):
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+                n += self.add(d["data"], anchor_of(f.stem))
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        return n
+
+    def search(self, text, lat, lon, radius=SEARCH_M, limit=120):
+        """Elements (Overpass-like nodes) whose name holds every word of `text`, nearest to (lat, lon) first."""
+        words = [w for w in fold(text).split() if w]
+        if not words:
+            return []
+        out = []
+        with self._lock:
+            items = list(self.stops.values())
+        for it in items:
+            nm = fold(it["name"])
+            if all(w in nm for w in words) and _near(lat, lon, it["lat"], it["lon"], radius):
+                k = math.cos(math.radians(lat)) * 111320
+                d = math.hypot((it["lon"] - lon) * k, (it["lat"] - lat) * 110574)
+                out.append((d, {"type": "node", "id": it["id"], "lat": it["lat"], "lon": it["lon"], "tags": it["tags"]}))
+        out.sort(key=lambda x: x[0])
+        return [e for _, e in out[:limit]]
+
+    def find_lines(self, ref, lat, lon, radius=SEARCH_M):
+        """Relation heads whose number is `ref` (any case), known to be near (lat, lon) or of unknown place."""
+        want = fold(ref).strip()
+        if not want:
+            return []
+        out = []
+        with self._lock:
+            items = list(self.lines.values())
+        for it in items:
+            if fold(it["tags"].get("ref")) != want:
+                continue
+            a = it.get("anchor")
+            if a is not None and not _near(lat, lon, a[0], a[1], radius + 5000):
+                continue
+            out.append({"type": "relation", "id": it["id"], "tags": it["tags"], "members": []})
+        return out
+
+
+def clean_ref(text):
+    """The line number as typed, or None when it is not one (letters, digits, - and / only, at most 8, with a digit)."""
+    t = (text or "").strip()
+    return t if re.fullmatch(r"[A-Za-z0-9/-]{1,8}", t) and re.search(r"\d", t) else None
+
+
+def lines_query(ref, lat, lon, radius=SEARCH_M):
+    r = clean_ref(ref)
+    if r is None:
+        raise ValueError("not a line number")
+    return (f'[out:json][timeout:50];rel[type=route][route~"{MODES}"][ref="{r}"](around:{int(radius)},{lat:.4f},{lon:.4f});out tags;')
+
+
+def lines_key(ref, lat, lon):
+    return f"lines_{re.sub(r'[^A-Za-z0-9]', '', fold(ref))}_{round(lat, 1):.1f}_{round(lon, 1):.1f}"
+
+
 # ---- cache ----------------------------------------------------------------------------------------------------------
 
 def default_cache_dir():
@@ -479,6 +611,13 @@ class Service:
         self.upstream_once = (lambda q: fetch_upstream(q, rounds=1)) if upstream is fetch_upstream else upstream
         self.started = time.time()
         self.served = {"cached": 0, "fetched": 0, "stale": 0, "failed": 0}
+        self.index = StopIndex()
+        self.indexed = 0
+
+    def load_index(self):
+        """Index the cache folder (call from a thread at start: it can hold many answers)."""
+        self.indexed = self.index.load(self.cache.dir)
+        say(f"index: {self.indexed} entries, {len(self.index.stops)} stops, {len(self.index.lines)} lines")
 
     def get(self, key, query, post=None, upstream=None):
         """(text, cached): a fresh cached answer, else a fetched one (kept; `post` shrinks it first), else a stale cached
@@ -503,6 +642,7 @@ class Service:
             if post:
                 fresh = post(fresh)
             self.cache.put(key, fresh)
+            self.index.add(fresh, anchor_of(key))
             self.served["fetched"] += 1
             say(f"{key}: fetched {len(fresh) // 1024} KB")
             return fresh, False
@@ -564,7 +704,8 @@ def make_handler(service, port):
                 if u.path == "/v1/status":
                     return self.send_json(200, json.dumps({
                         "ok": True, "version": VERSION, "uptime": time.time() - service.started,
-                        "served": service.served, "log": log_lines[-20:], "cache": str(service.cache.dir)}))
+                        "served": service.served, "log": log_lines[-20:], "cache": str(service.cache.dir),
+                        "index": {"stops": len(service.index.stops), "lines": len(service.index.lines)}}))
                 if u.path == "/v1/nearby":
                     lat, lon = float(q["lat"][0]), float(q["lon"][0])
                     if not (-85 <= lat <= 85 and -180 <= lon <= 180):
@@ -596,7 +737,23 @@ def make_handler(service, port):
                     lat, lon = float(q["lat"][0]), float(q["lon"][0])
                     if not (-85 <= lat <= 85 and -180 <= lon <= 180):
                         return self.fail(400, "lat / lon out of range")
-                    text, cached = service.get(search_key(q["q"][0], lat, lon), search_query(q["q"][0], lat, lon))
+                    if q.get("local"):
+                        found = service.index.search(q["q"][0], lat, lon)
+                        text, cached = json.dumps({"elements": found, "local": True}, separators=(",", ":"), ensure_ascii=False), True
+                    else:
+                        text, cached = service.get(search_key(q["q"][0], lat, lon), search_query(q["q"][0], lat, lon))
+                elif u.path == "/v1/lines":
+                    lat, lon = float(q["lat"][0]), float(q["lon"][0])
+                    if not (-85 <= lat <= 85 and -180 <= lon <= 180):
+                        return self.fail(400, "lat / lon out of range")
+                    ref = clean_ref(q["ref"][0])
+                    if ref is None:
+                        return self.fail(400, "not a line number")
+                    if q.get("local"):
+                        found = service.index.find_lines(ref, lat, lon)
+                        text, cached = json.dumps({"elements": found, "local": True}, separators=(",", ":"), ensure_ascii=False), True
+                    else:
+                        text, cached = service.get(lines_key(ref, lat, lon), lines_query(ref, lat, lon))
                 else:
                     return self.fail(404, "unknown path")
             except (KeyError, IndexError, ValueError):
@@ -613,6 +770,7 @@ def serve(port=PORT, cache_dir=None, service=None):
     httpd = ThreadingHTTPServer(("127.0.0.1", port), make_handler(service, port))
     httpd.daemon_threads = True
     say(f"{APP} {VERSION} listening on 127.0.0.1:{port}, cache {service.cache.dir}")
+    threading.Thread(target=service.load_index, daemon=True).start()
     return httpd, service
 
 
