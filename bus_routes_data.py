@@ -34,7 +34,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 APP = "earth-bus-routes-data"
 PORT = 47630
 UA = f"{APP}/{VERSION} (+https://github.com/Robitnik/earth-bus-routes)"   # Overpass refuses clients without one
@@ -97,21 +97,50 @@ def route_query(rel_id):
 
 
 def nearby_key(lat, lon):
-    return f"near2_{snap(lat):.3f}_{snap(lon):.3f}"      # (near_: before the bus stations were asked for)
+    return f"near3_{snap(lat):.3f}_{snap(lon):.3f}"      # (near_: before the bus stations; near2_: before the stops had their number in the route)
 
 
 def route_key(rel_id):
     return f"route_{int(rel_id)}"
 
 
+def stop_sequence(members):
+    """The members of a route relation that are its stops, in the order listed: the platforms, else the stop positions, else
+    any nodes. Returns the list of refs (a stop listed twice, as a loop does at its ends, is listed twice)."""
+    nodes = [m for m in members if m.get("type") == "node"]
+    for prefix in ("platform", "stop"):
+        seq = [m["ref"] for m in nodes if (m.get("role") or "").startswith(prefix)]
+        if len(seq) >= 2:
+            return seq
+    return [m["ref"] for m in nodes]
+
+
 def slim_nearby(text):
     """The "nearby" answer without what the mod does not read: a route relation lists every way of its line (hundreds), the
-    mod only needs which of the stops around here it calls at. Returns the text of the smaller answer."""
+    mod only needs which of the stops around here it calls at and where in the route they are: each kept member gets `i`, its
+    place (1 = first stop) among the route's stops, and the relation gets `n` (how many stops) and `ordered` (the tags promise
+    the order: public_transport:version 2). Returns the text of the smaller answer."""
     data = json.loads(text)
     ids = {e["id"] for e in data.get("elements", []) if e.get("type") == "node"}
     for e in data.get("elements", []):
         if e.get("type") == "relation":
-            e["members"] = [m for m in e.get("members", []) if m.get("type") == "node" and m.get("ref") in ids]
+            full = e.get("members", [])
+            seq = stop_sequence(full)
+            places = {}
+            for i, ref in enumerate(seq, 1):
+                places.setdefault(ref, []).append(i)
+            kept = []
+            for m in full:
+                if m.get("type") == "node" and m.get("ref") in ids:
+                    kept.append(m)
+            for m in kept:
+                if m["ref"] in places:
+                    m["i"] = places[m["ref"]][0]
+                    if len(places[m["ref"]]) > 1:
+                        m["j"] = places[m["ref"]][-1]           # a stop listed twice (a loop's first and last)
+            e["members"] = kept
+            e["n"] = len(seq)
+            e["ordered"] = (e.get("tags") or {}).get("public_transport:version") == "2"
     return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
 
 
