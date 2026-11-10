@@ -8,6 +8,10 @@ bus stops and bus routes the mod wants, keeps the answers on disk and hands them
   GET /v1/info                          {"api": 1, "app": "earth-bus-routes-data", "version": ...}
   GET /v1/nearby?lat=..&lon=..          stops and the routes calling at them around a point
   GET /v1/route?id=..                   one route relation with its geometry and its stops' tags
+  GET /v1/path?pts=lat,lon;lat,lon;..   the road route through 2..25 points (OSRM): {points, legs, dist, dur, source}
+  GET /v1/along?pts=...                 the bus stops within 30 m of that road route
+  GET /v1/stations?lat=..&lon=..        the bus stations within 25 km of a point
+  GET /v1/search?q=..&lat=..&lon=..     stations and stops by name within 40 km of a point
   GET /v1/status                        what it did lately (for the Add-ons page's log)
 
 Every answer is {"ok": true, "cached": bool, "data": <Overpass JSON>} or {"ok": false, "error": "..."}.
@@ -17,6 +21,7 @@ Map data (c) OpenStreetMap contributors, ODbL. Standard library only. MIT licenc
 """
 import argparse
 import hashlib
+import math
 import json
 import os
 import pathlib
@@ -29,7 +34,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 APP = "earth-bus-routes-data"
 PORT = 47630
 UA = f"{APP}/{VERSION} (+https://github.com/Robitnik/earth-bus-routes)"   # Overpass refuses clients without one
@@ -47,6 +52,17 @@ BACKOFF_S = (1.0, 3.0, 8.0)
 TIMEOUT_S = 45                   # a public server that takes longer is overloaded: try the next one
 MAX_BYTES = 12 * 1024 * 1024
 MODES = "^(bus|trolleybus|minibus|share_taxi)$"
+FEATURES = ["path", "along", "search", "stations"]
+STATIONS_M = 25000
+STATIONS_CELL_DEG = 0.05
+OSRM = ["https://router.project-osrm.org", "https://routing.openstreetmap.de/routed-car"]
+OSRM_TIMEOUT_S = 25
+MAX_WAYPOINTS = 25
+MAX_LEG_M = 60000
+MAX_PATH_POINTS = 2000
+ALONG_M = 30
+SEARCH_M = 40000
+STRAIGHT_MS = 40 / 3.6            # speed assumed on a straight fallback leg
 
 log_lines = []                    # the last few events, for /v1/status
 _lock = threading.Lock()          # one request to the public servers at a time
@@ -109,6 +125,229 @@ def check_answer(data):
     return True, ""
 
 
+# ---- paths and searches (pure) ------------------------------------------------------------------------------------
+
+def parse_pts(text, lo=2, hi=MAX_WAYPOINTS):
+    """[(lat, lon), ...] of "lat,lon;lat,lon;..." or raises ValueError."""
+    out = []
+    for part in (text or "").split(";"):
+        a, b = part.split(",")
+        lat, lon = float(a), float(b)
+        if not (-85 <= lat <= 85 and -180 <= lon <= 180):      # (also false for nan)
+            raise ValueError("point out of range")
+        out.append((round(lat, 6), round(lon, 6)))
+    if not lo <= len(out) <= hi:
+        raise ValueError(f"{lo}..{hi} points wanted")
+    return out
+
+
+def hav(a, b):
+    r = 6371008.8
+    p1, p2 = math.radians(a[0]), math.radians(b[0])
+    dp, dl = p2 - p1, math.radians(b[1] - a[1])
+    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(h)))
+
+
+def simplify(points, tol_m):
+    """Douglas-Peucker on a local flat projection (iterative: a route has thousands of points)."""
+    n = len(points)
+    if n < 3:
+        return list(points)
+    lat0 = math.radians(points[0][0])
+    xy = [((p[1] - points[0][1]) * 111320 * math.cos(lat0), (p[0] - points[0][0]) * 110574) for p in points]
+    keep = [False] * n
+    keep[0] = keep[-1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        i, j = stack.pop()
+        ax, ay = xy[i]
+        bx, by = xy[j]
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy
+        best, k = -1.0, -1
+        for m in range(i + 1, j):
+            px, py = xy[m]
+            if L2 == 0:
+                d = math.hypot(px - ax, py - ay)
+            else:
+                t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L2))
+                d = math.hypot(px - ax - t * dx, py - ay - t * dy)
+            if d > best:
+                best, k = d, m
+        if best > tol_m:
+            keep[k] = True
+            stack += [(i, k), (k, j)]
+    return [p for p, f in zip(points, keep) if f]
+
+
+def osrm_url(base, pts):
+    coords = ";".join(f"{lon:.6f},{lat:.6f}" for lat, lon in pts)
+    return f"{base}/route/v1/driving/{coords}?overview=full&geometries=geojson&steps=false"
+
+
+def parse_osrm(data):
+    """{points, legs:[{dist, dur}], dist, dur, source:"osrm"} of an OSRM answer, or ValueError."""
+    if not isinstance(data, dict) or data.get("code") != "Ok" or not data.get("routes"):
+        raise ValueError(f"no route ({data.get('code') if isinstance(data, dict) else 'bad answer'})")
+    r = data["routes"][0]
+    pts = [(float(c[1]), float(c[0])) for c in r["geometry"]["coordinates"]]
+    tol = 3.0
+    pts = simplify(pts, tol)
+    while len(pts) > MAX_PATH_POINTS:
+        tol *= 2
+        pts = simplify(pts, tol)
+    legs = [{"dist": round(float(l.get("distance") or 0)), "dur": round(float(l.get("duration") or 0))} for l in r.get("legs", [])]
+    return {"points": [[round(a, 6), round(b, 6)] for a, b in pts], "legs": legs, "dist": round(float(r.get("distance") or 0)),
+            "dur": round(float(r.get("duration") or 0)), "source": "osrm"}
+
+
+def straight_path(pts):
+    """The stations joined by straight lines: what the mod gets while no routing server answers (never cached)."""
+    legs = []
+    for a, b in zip(pts, pts[1:]):
+        d = hav(a, b)
+        legs.append({"dist": round(d), "dur": round(d / STRAIGHT_MS)})
+    return {"points": [[a, b] for a, b in pts], "legs": legs, "dist": sum(l["dist"] for l in legs),
+            "dur": sum(l["dur"] for l in legs), "source": "straight"}
+
+
+def check_legs(pts):
+    for a, b in zip(pts, pts[1:]):
+        if hav(a, b) > MAX_LEG_M:
+            raise ValueError("a leg is longer than 60 km")
+
+
+def _hash(prefix, pts):
+    return prefix + hashlib.sha1(";".join(f"{a:.5f},{b:.5f}" for a, b in pts).encode()).hexdigest()[:20]
+
+
+def path_key(pts):
+    return _hash("path_", pts)
+
+
+def along_key(pts):
+    return _hash("along_", pts)
+
+
+TILE_LAT, TILE_LON = 0.02, 0.03       # the boxes the stops along a road are asked for (about 2.2 x 2.1 km)
+ALONG_STATION_M = 150                 # a bus station is "on" the road this near (it is a whole yard)
+MAX_TILES = 90
+
+
+def path_tiles(points):
+    """The set of (i, j) tiles a road passes through, found by walking it in steps well under a tile."""
+    tiles = set()
+    for a, b in zip(points, points[1:]):
+        n = max(1, int(hav(a, b) / 400))
+        for k in range(n + 1):
+            lat = a[0] + (b[0] - a[0]) * k / n
+            lon = a[1] + (b[1] - a[1]) * k / n
+            tiles.add((math.floor(lat / TILE_LAT), math.floor(lon / TILE_LON)))
+    if len(points) == 1:
+        tiles.add((math.floor(points[0][0] / TILE_LAT), math.floor(points[0][1] / TILE_LON)))
+    return tiles
+
+
+def along_query(points):
+    """One query for the stops in every tile the road passes through (a small box around each: much less than the box of
+    the whole road). The answer is cut down to the stops on the road by filter_along."""
+    tiles = sorted(path_tiles([tuple(p) for p in points]))
+    if len(tiles) > MAX_TILES:
+        raise ValueError("the road is too long")
+    pad = 0.0004
+    parts = []
+    for i, j in tiles:
+        box = f"{i * TILE_LAT - pad:.4f},{j * TILE_LON - pad:.4f},{(i + 1) * TILE_LAT + pad:.4f},{(j + 1) * TILE_LON + pad:.4f}"
+        parts.append(f"node[highway=bus_stop]({box});node[public_transport=platform]({box});"
+                     f"node[public_transport=stop_position]({box});nwr[amenity=bus_station]({box});")
+    return f"[out:json][timeout:90];({''.join(parts)});out tags center;"
+
+
+def dist_to_path(lat, lon, path):
+    """Metres from a point to a polyline [(lat, lon), ...] (local flat projection)."""
+    k = math.cos(math.radians(lat)) * 111320
+    best = float("inf")
+    for (la, lo), (lb, lb2) in zip(path, path[1:]):
+        ax, ay = (lo - lon) * k, (la - lat) * 110574
+        bx, by = (lb2 - lon) * k, (lb - lat) * 110574
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy
+        t = 0.0 if L2 == 0 else max(0.0, min(1.0, -(ax * dx + ay * dy) / L2))
+        d = math.hypot(ax + t * dx, ay + t * dy)
+        if d < best:
+            best = d
+    return best
+
+
+def filter_along(text, points, radius=ALONG_M):
+    """The answer of along_query without the stops that are not on the road ('points' = [[lat, lon], ...])."""
+    path = [tuple(p) for p in points]
+    data = json.loads(text)
+    keep = []
+    for e in data.get("elements", []):
+        tags = e.get("tags") or {}
+        lat, lon = e.get("lat"), e.get("lon")
+        if lat is None and e.get("center"):
+            lat, lon = e["center"].get("lat"), e["center"].get("lon")
+        if lat is None or lon is None:
+            continue
+        limit = ALONG_STATION_M if tags.get("amenity") == "bus_station" else radius
+        if dist_to_path(lat, lon, path) <= limit:
+            keep.append(e)
+    data["elements"] = keep
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+
+
+FOLD = {"a": "a\u00e1\u00e0\u00e4\u00e2", "c": "c\u010d", "d": "d\u010f", "e": "e\u00e9\u011b\u00eb\u00e8", "i": "i\u00ed\u00ee",
+        "l": "l\u013e\u013a\u0142", "n": "n\u0148\u0144", "o": "o\u00f3\u00f6\u00f4", "r": "r\u0159", "s": "s\u0161\u015b",
+        "t": "t\u0165", "u": "u\u00fa\u016f\u00fc\u00fb", "y": "y\u00fd", "z": "z\u017e\u017a"}
+
+
+def name_regex(text):
+    """A case-insensitive Overpass regex for what the player typed: plain letters also match their accented forms;
+    everything else is matched literally. None when there is too little to search for."""
+    t = " ".join((text or "").split())[:40]
+    if len(t) < 2:
+        return None
+    out = []
+    for ch in t:
+        lo = ch.lower()
+        if lo in FOLD:
+            out.append("[" + FOLD[lo] + "]")
+        elif ch.isalnum() or ch in " -":
+            out.append(ch)
+        else:
+            out.append(".")
+    return "".join(out)
+
+
+def search_query(text, lat, lon, radius=SEARCH_M):
+    rx = name_regex(text)
+    if rx is None:
+        raise ValueError("search text too short")
+    a = f"around:{int(radius)},{lat:.4f},{lon:.4f}"
+    n = f'[name~"{rx}",i]'
+    return (f"[out:json][timeout:50];(nwr[amenity=bus_station]{n}({a});node[highway=bus_stop]{n}({a});"
+            f"node[public_transport=platform]{n}({a}););out tags center 120;")
+
+
+def stations_query(lat, lon, radius=STATIONS_M):
+    a = f"around:{int(radius)},{lat:.4f},{lon:.4f}"
+    return (f"[out:json][timeout:50];(nwr[amenity=bus_station]({a});nwr[public_transport=station][bus=yes]({a}););"
+            "out tags center 400;")
+
+
+def stations_key(lat, lon):
+    snap5 = lambda v: round(round(v / STATIONS_CELL_DEG) * STATIONS_CELL_DEG, 4)
+    return f"stations_{snap5(lat):.2f}_{snap5(lon):.2f}"
+
+
+def search_key(text, lat, lon):
+    h = hashlib.sha1(f"{' '.join(text.lower().split())}|{lat:.1f}|{lon:.1f}".encode()).hexdigest()[:20]
+    return "search_" + h
+
+
 # ---- cache ----------------------------------------------------------------------------------------------------------
 
 def default_cache_dir():
@@ -150,14 +389,14 @@ def post_overpass(url, query):
     return body.decode("utf-8")
 
 
-def fetch_upstream(query, mirrors=None, sender=None, sleep=time.sleep, clock=time.monotonic):
+def fetch_upstream(query, mirrors=None, sender=None, sleep=time.sleep, clock=time.monotonic, rounds=2):
     """The answer's text from the first mirror that gives a good one; raises RuntimeError with every failure when none."""
     global _last_call
     mirrors = mirrors or MIRRORS
     sender = sender or post_overpass
     errors = []
     with _lock:
-        for n, url in enumerate(mirrors * 2):                  # every mirror twice, with a longer wait between
+        for n, url in enumerate(mirrors * rounds):             # every mirror twice (once for a request somebody waits long for), a longer wait between
             gap = MIN_GAP_S - (clock() - _last_call)
             if gap > 0:
                 sleep(gap)
@@ -178,13 +417,41 @@ def fetch_upstream(query, mirrors=None, sender=None, sleep=time.sleep, clock=tim
     raise RuntimeError("; ".join(errors[-4:]) or "no mirror")
 
 
+def get_url(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=OSRM_TIMEOUT_S) as r:
+        return r.read(MAX_BYTES + 1).decode("utf-8")
+
+
+def fetch_osrm(pts, bases=None, getter=None, sleep=time.sleep):
+    """The text of the path answer for `pts` from the first routing server that has a route; RuntimeError when none."""
+    getter = getter or get_url
+    errors = []
+    for n, base in enumerate((bases or OSRM) * 2):
+        host = urllib.parse.urlsplit(base).hostname
+        try:
+            return json.dumps(parse_osrm(json.loads(getter(osrm_url(base, pts)))), separators=(",", ":"))
+        except urllib.error.HTTPError as e:
+            errors.append(f"{host}: HTTP {e.code}")
+            if e.code == 400:                  # OSRM: no road near a point; another server will not know better
+                break
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError) as e:
+            errors.append(f"{host}: {type(e).__name__} {str(e)[:60]}")
+            if isinstance(e, ValueError) and "no route" in str(e):
+                break
+        sleep(BACKOFF_S[min(n, len(BACKOFF_S) - 1)] / 2)
+    raise RuntimeError("; ".join(errors[-3:]) or "no routing server")
+
+
 class Service:
-    def __init__(self, cache, upstream=fetch_upstream, ttl=TTL_S):
-        self.cache, self.upstream, self.ttl = cache, upstream, ttl
+    def __init__(self, cache, upstream=fetch_upstream, ttl=TTL_S, router=fetch_osrm):
+        self.cache, self.upstream, self.ttl, self.router = cache, upstream, ttl, router
+        # the stops along a road are a big query: one round of mirrors, so the answer comes (or fails) before the mod stops waiting
+        self.upstream_once = (lambda q: fetch_upstream(q, rounds=1)) if upstream is fetch_upstream else upstream
         self.started = time.time()
         self.served = {"cached": 0, "fetched": 0, "stale": 0, "failed": 0}
 
-    def get(self, key, query, post=None):
+    def get(self, key, query, post=None, upstream=None):
         """(text, cached): a fresh cached answer, else a fetched one (kept; `post` shrinks it first), else a stale cached
         one, else RuntimeError. Requests for one key wait for each other: the second finds the first one's answer cached."""
         with _key_locks_guard:
@@ -195,7 +462,7 @@ class Service:
                 self.served["cached"] += 1
                 return text, True
             try:
-                fresh = self.upstream(query)
+                fresh = (upstream or self.upstream)(query)
             except RuntimeError as e:
                 if text is not None:
                     self.served["stale"] += 1
@@ -210,6 +477,23 @@ class Service:
             self.served["fetched"] += 1
             say(f"{key}: fetched {len(fresh) // 1024} KB")
             return fresh, False
+
+    def path(self, pts):
+        """(dict, cached): the road route through pts; a straight-line one (never kept) when no routing server answers."""
+        try:
+            text, cached = self.get(path_key(pts), pts, upstream=self.router)
+            return json.loads(text), cached
+        except RuntimeError as e:
+            say(f"path: {e}; straight lines instead")
+            return straight_path(pts), False
+
+    def along(self, pts):
+        """(text, cached) of the stops near the road route; none while there is only a straight fallback."""
+        p, _ = self.path(pts)
+        if p["source"] != "osrm":
+            return '{"elements":[],"fallback":true}', False
+        road = p["points"]
+        return self.get(along_key(pts), along_query(road), post=lambda text: filter_along(text, road), upstream=self.upstream_once)
 
 
 # ---- HTTP -----------------------------------------------------------------------------------------------------------
@@ -247,7 +531,7 @@ def make_handler(service, port):
             q = urllib.parse.parse_qs(u.query)
             try:
                 if u.path == "/v1/info":
-                    return self.send_json(200, json.dumps({"ok": True, "api": 1, "app": APP, "version": VERSION}))
+                    return self.send_json(200, json.dumps({"ok": True, "api": 1, "app": APP, "version": VERSION, "features": FEATURES}))
                 if u.path == "/v1/status":
                     return self.send_json(200, json.dumps({
                         "ok": True, "version": VERSION, "uptime": time.time() - service.started,
@@ -263,6 +547,27 @@ def make_handler(service, port):
                     if not 0 < rid < 10 ** 12:
                         return self.fail(400, "id out of range")
                     text, cached = service.get(route_key(rid), route_query(rid))
+                elif u.path == "/v1/path":
+                    pts = parse_pts(q["pts"][0])
+                    check_legs(pts)
+                    p, cached = service.path(pts)
+                    text = json.dumps(p, separators=(",", ":"))
+                elif u.path == "/v1/along":
+                    pts = parse_pts(q["pts"][0])
+                    check_legs(pts)
+                    text, cached = service.along(pts)
+                elif u.path == "/v1/stations":
+                    lat, lon = float(q["lat"][0]), float(q["lon"][0])
+                    if not (-85 <= lat <= 85 and -180 <= lon <= 180):
+                        return self.fail(400, "lat / lon out of range")
+                    c = STATIONS_CELL_DEG
+                    slat, slon = round(round(lat / c) * c, 4), round(round(lon / c) * c, 4)
+                    text, cached = service.get(stations_key(lat, lon), stations_query(slat, slon))
+                elif u.path == "/v1/search":
+                    lat, lon = float(q["lat"][0]), float(q["lon"][0])
+                    if not (-85 <= lat <= 85 and -180 <= lon <= 180):
+                        return self.fail(400, "lat / lon out of range")
+                    text, cached = service.get(search_key(q["q"][0], lat, lon), search_query(q["q"][0], lat, lon))
                 else:
                     return self.fail(404, "unknown path")
             except (KeyError, IndexError, ValueError):
