@@ -13,6 +13,8 @@ bus stops and bus routes the mod wants, keeps the answers on disk and hands them
   GET /v1/stations?lat=..&lon=..        the bus stations within 25 km of a point
   GET /v1/search?q=..&lat=..&lon=..     stations and stops by name within 40 km of a point (&local=1: only what this service
                                         has already seen, answered at once)
+  GET /v1/towns?lat=..&lon=..           the cities, towns and villages within 40 km of a point (for the map)
+  GET /v1/progress                      what the service is waiting for right now (for a progress bar)
   GET /v1/lines?ref=..&lat=..&lon=..    the bus lines with this number within 40 km (&local=1 likewise)
   GET /v1/status                        what it did lately (for the Add-ons page's log)
 
@@ -37,7 +39,7 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.4.1"
+VERSION = "0.6.0"
 APP = "earth-bus-routes-data"
 PORT = 47630
 UA = f"{APP}/{VERSION} (+https://github.com/Robitnik/earth-bus-routes)"   # Overpass refuses clients without one
@@ -55,7 +57,13 @@ BACKOFF_S = (1.0, 3.0, 8.0)
 TIMEOUT_S = 45                   # a public server that takes longer is overloaded: try the next one
 MAX_BYTES = 12 * 1024 * 1024
 MODES = "^(bus|trolleybus|minibus|share_taxi)$"
-FEATURES = ["path", "along", "search", "stations", "local", "lines"]
+PHOTON = "https://photon.komoot.io/api/"
+PHOTON_TIMEOUT_S = 8
+PHOTON_COOLDOWN_S = 60          # after a failure the geocoder is left alone this long (searches go on without it)
+_photon_down_until = 0.0
+PLACE_KINDS = {"city": 5, "town": 4, "municipality": 3, "village": 3, "borough": 2, "suburb": 2, "hamlet": 2, "quarter": 1,
+               "neighbourhood": 1, "locality": 1}
+FEATURES = ["path", "along", "search", "stations", "local", "lines", "places", "progress", "towns"]
 STATIONS_M = 25000
 STATIONS_CELL_DEG = 0.05
 OSRM = ["https://router.project-osrm.org", "https://routing.openstreetmap.de/routed-car"]
@@ -96,15 +104,23 @@ def nearby_query(lat, lon, radius=RADIUS_M):
 
 
 def route_query(rel_id):
-    return f"[out:json][timeout:50];rel({int(rel_id)});out body geom;(node(r);way(r););out tags center;"
+    # the relation with its geometry, its members, and the bus stops within 30 m of its ways: the platform of the other side of
+    # the road is not a member (a stop is listed once, for one direction), but the other direction's bus stops there
+    return (f"[out:json][timeout:60];rel({int(rel_id)})->.r;.r out body geom;(node(r.r);way(r.r););out tags center;"
+            f"way(r.r)->.w;(node[highway=bus_stop](around.w:30);node[public_transport=platform](around.w:30););out tags center;")
 
 
 def nearby_key(lat, lon):
     return f"near3_{snap(lat):.3f}_{snap(lon):.3f}"      # (near_: before the bus stations; near2_: before the stops had their number in the route)
 
 
+def route_query_basic(rel_id):
+    """The route without the bus stops near its road: the fallback when a server does not take the longer query."""
+    return f"[out:json][timeout:50];rel({int(rel_id)});out body geom;(node(r);way(r););out tags center;"
+
+
 def route_key(rel_id):
-    return f"route_{int(rel_id)}"
+    return f"route2_{int(rel_id)}"          # (route_: before the bus stops near the road were asked for)
 
 
 def stop_sequence(members):
@@ -364,6 +380,38 @@ def search_query(text, lat, lon, radius=SEARCH_M):
             f"node[public_transport=platform]{n}({a}););out tags center 120;")
 
 
+TOWNS_M = 40000
+TOWNS_CELL_DEG = 0.25
+TOWN_RANK = {"city": 3, "town": 2, "village": 1}
+
+
+def towns_query(lat, lon, radius=TOWNS_M):
+    return (f'[out:json][timeout:50];node[place~"^(city|town|village)$"][name]'
+            f"(around:{int(radius)},{lat:.4f},{lon:.4f});out tags;")
+
+
+def towns_key(lat, lon):
+    snap = lambda v: round(round(v / TOWNS_CELL_DEG) * TOWNS_CELL_DEG, 2)
+    return f"towns_{snap(lat):.2f}_{snap(lon):.2f}"
+
+
+def slim_towns(text):
+    """[{name, lat, lon, kind, population}] of a towns answer, the biggest places first."""
+    out = []
+    for e in json.loads(text).get("elements", []):
+        tg = e.get("tags") or {}
+        kind = tg.get("place")
+        if kind not in TOWN_RANK or not tg.get("name") or e.get("lat") is None:
+            continue
+        try:
+            pop = int(str(tg.get("population", "0")).replace(" ", "").split(";")[0])
+        except ValueError:
+            pop = 0
+        out.append({"name": tg["name"], "lat": e["lat"], "lon": e["lon"], "kind": kind, "population": pop})
+    out.sort(key=lambda p: (-TOWN_RANK[p["kind"]], -p["population"], p["name"]))
+    return json.dumps({"towns": out}, separators=(",", ":"), ensure_ascii=False)
+
+
 def stations_query(lat, lon, radius=STATIONS_M):
     a = f"around:{int(radius)},{lat:.4f},{lon:.4f}"
     return (f"[out:json][timeout:50];(nwr[amenity=bus_station]({a});nwr[public_transport=station][bus=yes]({a}););"
@@ -509,6 +557,130 @@ def lines_key(ref, lat, lon):
     return f"lines_{re.sub(r'[^A-Za-z0-9]', '', fold(ref))}_{round(lat, 1):.1f}_{round(lon, 1):.1f}"
 
 
+# ---- what the service is doing (for the progress bar) -----------------------------------------------------------------
+
+class Activity:
+    """The slow things in flight: {id, what, label, state, mirror, of, since}. The mod asks /v1/progress about once a second
+    while it waits, and shows it."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._items = {}
+        self._n = 0
+
+    def begin(self, what, label=""):
+        with self._lock:
+            self._n += 1
+            self._items[self._n] = {"id": self._n, "what": what, "label": label, "state": "waiting", "mirror": 0, "of": 0,
+                                    "since": time.monotonic()}
+            return self._n
+
+    def update(self, token, **kw):
+        with self._lock:
+            if token in self._items:
+                self._items[token].update(kw)
+
+    def end(self, token):
+        with self._lock:
+            self._items.pop(token, None)
+
+    def snapshot(self):
+        now = time.monotonic()
+        with self._lock:
+            items = [dict(i, elapsed=round(now - i["since"], 1)) for i in self._items.values()]
+        for i in items:
+            i.pop("since", None)
+        items.sort(key=lambda i: i["id"])
+        return {"busy": items, "waiting": sum(1 for i in items if i["state"] == "waiting")}
+
+
+ACTIVITY = Activity()
+CURRENT = threading.local()                  # the cache key of the request this thread is serving: the label of its progress
+
+
+def label_of(key):
+    """"near3_50.2_15.8" -> "stops nearby", "route2_7185111" -> "route", ..."""
+    kind = re.sub(r"[_\d].*$", "", key or "")
+    return {"near": "stops nearby", "route": "route", "stations": "bus stations", "search": "search", "lines": "lines",
+            "along": "stops along the road", "path": "road", "geo": "search"}.get(kind, kind)
+
+
+# ---- the geocoder: names of places and stops, fast ----------------------------------------------------------------------
+
+def photon_url(q, lat, lon, tag, limit):
+    qs = urllib.parse.urlencode({"q": q, "lat": f"{lat:.4f}", "lon": f"{lon:.4f}", "limit": limit, "osm_tag": tag})
+    return f"{PHOTON}?{qs}"
+
+
+def parse_photon(data, want):
+    """[{id, name, lat, lon, kind, state, country, osm_key, osm_value}] of a Photon answer; want: "place" | "stop"."""
+    out, seen = [], set()
+    for f in (data or {}).get("features", []):
+        pr = f.get("properties") or {}
+        try:
+            lon, lat = f["geometry"]["coordinates"][:2]
+        except (KeyError, TypeError, ValueError):
+            continue
+        name = pr.get("name")
+        if not name:
+            continue
+        key, val = pr.get("osm_key"), pr.get("osm_value")
+        if want == "place":
+            if key != "place" or val not in PLACE_KINDS:
+                continue
+        elif not (val in ("bus_station", "bus_stop") or (key == "public_transport" and val in ("platform", "station"))):
+            continue
+        sig = (name, round(lat, 3), round(lon, 3))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append({"id": pr.get("osm_id"), "name": name, "lat": lat, "lon": lon, "kind": val, "state": pr.get("state"),
+                    "country": pr.get("countrycode"), "osm_key": key, "osm_value": val})
+    return out
+
+
+def photon_get(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=PHOTON_TIMEOUT_S) as r:
+        return json.loads(r.read(MAX_BYTES).decode("utf-8"))
+
+
+def geo_search(q, lat, lon, getter=None, clock=time.monotonic):
+    """Places and bus stops named like `q`, near (lat, lon): {"elements": [Overpass-like nodes of the stops], "places": [...],
+    "source": "photon"}; RuntimeError when the geocoder does not answer (and for a minute after, without trying again: it is
+    a free public service, and a search must not wait for its timeout every time). Three small requests, one after another."""
+    global _photon_down_until
+    if getter is None and clock() < _photon_down_until:
+        raise RuntimeError("photon: resting after a failure")
+    getter = getter or photon_get
+    jobs = (("place", "place", 6), ("station", "amenity:bus_station", 8), ("stop", "highway:bus_stop", 12))
+    res, errors = {}, []
+    for name, tag, limit in jobs:
+        try:
+            res[name] = getter(photon_url(q, lat, lon, tag, limit))
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError) as e:
+            errors.append(f"photon: {type(e).__name__}")
+            break                                    # one failure: the rest would only wait as long
+    if not res:
+        _photon_down_until = clock() + PHOTON_COOLDOWN_S
+        raise RuntimeError("; ".join(errors[:1]) or "photon: no answer")
+    places = parse_photon(res.get("place"), "place")
+    places.sort(key=lambda p: -PLACE_KINDS.get(p["kind"], 0))
+    elements = []
+    for name in ("station", "stop"):
+        for it in parse_photon(res.get(name), "stop"):
+            tags = {"name": it["name"]}
+            tags["amenity" if it["osm_value"] == "bus_station" else "highway"] = it["osm_value"]
+            elements.append({"type": "node", "id": it["id"], "lat": it["lat"], "lon": it["lon"], "tags": tags})
+    return {"elements": elements, "places": [{k: p[k] for k in ("name", "lat", "lon", "kind", "state", "country")} for p in places],
+            "source": "photon"}
+
+
+def geo_key(q, lat, lon):
+    h = hashlib.sha1(f"{' '.join(fold(q).split())}|{lat:.1f}|{lon:.1f}".encode()).hexdigest()[:20]
+    return "geo_" + h
+
+
 # ---- cache ----------------------------------------------------------------------------------------------------------
 
 def default_cache_dir():
@@ -556,8 +728,18 @@ def fetch_upstream(query, mirrors=None, sender=None, sleep=time.sleep, clock=tim
     mirrors = mirrors or MIRRORS
     sender = sender or post_overpass
     errors = []
+    token = ACTIVITY.begin("overpass", label_of(getattr(CURRENT, "label", "")))
+    try:
+        return _fetch_upstream(query, mirrors, sender, sleep, clock, rounds, errors, token)
+    finally:
+        ACTIVITY.end(token)
+
+
+def _fetch_upstream(query, mirrors, sender, sleep, clock, rounds, errors, token):
+    global _last_call
     with _lock:
-        for n, url in enumerate(mirrors * rounds):             # every mirror twice (once for a request somebody waits long for), a longer wait between
+        for n, url in enumerate(mirrors * rounds):
+            ACTIVITY.update(token, state="running", mirror=n % len(mirrors) + 1, of=len(mirrors))             # every mirror twice (once for a request somebody waits long for), a longer wait between
             gap = MIN_GAP_S - (clock() - _last_call)
             if gap > 0:
                 sleep(gap)
@@ -586,9 +768,18 @@ def get_url(url):
 
 def fetch_osrm(pts, bases=None, getter=None, sleep=time.sleep):
     """The text of the path answer for `pts` from the first routing server that has a route; RuntimeError when none."""
+    token = ACTIVITY.begin("osrm", "road")
+    try:
+        return _fetch_osrm(pts, bases, getter, sleep, token)
+    finally:
+        ACTIVITY.end(token)
+
+
+def _fetch_osrm(pts, bases, getter, sleep, token):
     getter = getter or get_url
     errors = []
     for n, base in enumerate((bases or OSRM) * 2):
+        ACTIVITY.update(token, state="running", mirror=n % len(bases or OSRM) + 1, of=len(bases or OSRM))
         host = urllib.parse.urlsplit(base).hostname
         try:
             return json.dumps(parse_osrm(json.loads(getter(osrm_url(base, pts)))), separators=(",", ":"))
@@ -605,14 +796,25 @@ def fetch_osrm(pts, bases=None, getter=None, sleep=time.sleep):
 
 
 class Service:
-    def __init__(self, cache, upstream=fetch_upstream, ttl=TTL_S, router=fetch_osrm):
-        self.cache, self.upstream, self.ttl, self.router = cache, upstream, ttl, router
+    def __init__(self, cache, upstream=fetch_upstream, ttl=TTL_S, router=fetch_osrm, geocoder=geo_search):
+        self.cache, self.upstream, self.ttl, self.router, self.geocoder = cache, upstream, ttl, router, geocoder
         # the stops along a road are a big query: one round of mirrors, so the answer comes (or fails) before the mod stops waiting
         self.upstream_once = (lambda q: fetch_upstream(q, rounds=1)) if upstream is fetch_upstream else upstream
         self.started = time.time()
         self.served = {"cached": 0, "fetched": 0, "stale": 0, "failed": 0}
         self.index = StopIndex()
         self.indexed = 0
+
+    def geocode(self, q, lat, lon):
+        """(text, cached) of the geocoder's answer for a name (kept for a week); RuntimeError when it does not answer."""
+        def ask(query):
+            token = ACTIVITY.begin("photon", "search")
+            try:
+                ACTIVITY.update(token, state="running", mirror=1, of=1)
+                return json.dumps(self.geocoder(*query), separators=(",", ":"), ensure_ascii=False)
+            finally:
+                ACTIVITY.end(token)
+        return self.get(geo_key(q, lat, lon), (q, lat, lon), upstream=ask)
 
     def load_index(self):
         """Index the cache folder (call from a thread at start: it can hold many answers)."""
@@ -629,6 +831,7 @@ class Service:
             if text is not None and age is not None and age < self.ttl:
                 self.served["cached"] += 1
                 return text, True
+            CURRENT.label = key
             try:
                 fresh = (upstream or self.upstream)(query)
             except RuntimeError as e:
@@ -701,6 +904,8 @@ def make_handler(service, port):
             try:
                 if u.path == "/v1/info":
                     return self.send_json(200, json.dumps({"ok": True, "api": 1, "app": APP, "version": VERSION, "features": FEATURES}))
+                if u.path == "/v1/progress":
+                    return self.send_json(200, json.dumps({"ok": True, "data": ACTIVITY.snapshot()}))
                 if u.path == "/v1/status":
                     return self.send_json(200, json.dumps({
                         "ok": True, "version": VERSION, "uptime": time.time() - service.started,
@@ -716,7 +921,14 @@ def make_handler(service, port):
                     rid = int(q["id"][0])
                     if not 0 < rid < 10 ** 12:
                         return self.fail(400, "id out of range")
-                    text, cached = service.get(route_key(rid), route_query(rid))
+                    try:
+                        text, cached = service.get(route_key(rid), route_query(rid))
+                    except RuntimeError as e:
+                        if "HTTP 400" not in str(e):
+                            raise
+                        # the servers refuse the longer query (a syntax they do not know): the plain route, kept under its own key
+                        say(f"route {rid}: the query with the near bus stops was refused; the plain one instead")
+                        text, cached = service.get(f"route_{rid}", route_query_basic(rid))
                 elif u.path == "/v1/path":
                     pts = parse_pts(q["pts"][0])
                     check_legs(pts)
@@ -733,15 +945,30 @@ def make_handler(service, port):
                     c = STATIONS_CELL_DEG
                     slat, slon = round(round(lat / c) * c, 4), round(round(lon / c) * c, 4)
                     text, cached = service.get(stations_key(lat, lon), stations_query(slat, slon))
+                elif u.path == "/v1/towns":
+                    lat, lon = float(q["lat"][0]), float(q["lon"][0])
+                    if not (-85 <= lat <= 85 and -180 <= lon <= 180):
+                        return self.fail(400, "lat / lon out of range")
+                    c = TOWNS_CELL_DEG
+                    slat, slon = round(round(lat / c) * c, 4), round(round(lon / c) * c, 4)
+                    text, cached = service.get(towns_key(lat, lon), towns_query(slat, slon), post=slim_towns)
                 elif u.path == "/v1/search":
                     lat, lon = float(q["lat"][0]), float(q["lon"][0])
                     if not (-85 <= lat <= 85 and -180 <= lon <= 180):
                         return self.fail(400, "lat / lon out of range")
+                    if len(fold(q["q"][0]).strip()) < 2:
+                        return self.fail(400, "search text too short")
                     if q.get("local"):
                         found = service.index.search(q["q"][0], lat, lon)
                         text, cached = json.dumps({"elements": found, "local": True}, separators=(",", ":"), ensure_ascii=False), True
                     else:
-                        text, cached = service.get(search_key(q["q"][0], lat, lon), search_query(q["q"][0], lat, lon))
+                        try:
+                            text, cached = service.geocode(q["q"][0], lat, lon)
+                            if not json.loads(text).get("elements") and not json.loads(text).get("places"):
+                                raise RuntimeError("the geocoder found nothing")
+                        except (RuntimeError, ValueError):
+                            # no geocoder, or it knows nothing of this name: the map database itself (slow)
+                            text, cached = service.get(search_key(q["q"][0], lat, lon), search_query(q["q"][0], lat, lon))
                 elif u.path == "/v1/lines":
                     lat, lon = float(q["lat"][0]), float(q["lon"][0])
                     if not (-85 <= lat <= 85 and -180 <= lon <= 180):
