@@ -56,7 +56,7 @@ import urllib.request
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.10.0"
+VERSION = "0.10.1"
 APP = "earth-bus-routes-data"
 PORT = 47630
 UA = f"{APP}/{VERSION} (+https://github.com/Robitnik/earth-bus-routes)"   # Overpass refuses clients without one
@@ -2056,8 +2056,9 @@ class Service:
         except (ValueError, KeyError, TypeError, StopIteration):
             return text
 
-    def gtfs_route(self, rid):
-        """The text of a route answer for a line of the timetables: a relation with one way (the road through its stops, asked
+    def gtfs_route(self, rid, offline=False):
+        """`offline`: the road only from roads already kept (else straight lines between the stops), never a request.
+        The text of a route answer for a line of the timetables: a relation with one way (the road through its stops, asked
         of the routing servers in windows of 24 stops) and its stops with their times from the start, as the mod reads
         an OpenStreetMap route."""
         pat = self.gtfs.pattern(rid)
@@ -2070,8 +2071,12 @@ class Service:
             chunk = stops[i:i + window]
             pts = [(round(x["lat"], 6), round(x["lon"], 6)) for x in chunk]
             if len(pts) >= 2 and all(hav(a, b) <= MAX_LEG_M for a, b in zip(pts, pts[1:])):
-                p, _ = self.path(pts)
-                seg = [(a, b) for a, b in p["points"]]
+                if offline:
+                    kept, _ = self.cache.get(path_key(pts))
+                    seg = [(a, b) for a, b in json.loads(kept)["points"]] if kept else pts
+                else:
+                    p, _ = self.path(pts)
+                    seg = [(a, b) for a, b in p["points"]]
             else:
                 seg = pts
             road += seg if not road else seg[1:]
@@ -2185,6 +2190,7 @@ SHIFT_MAX_MINS = 720
 DEPOT_RADIUS_M = 10000
 DEPOT_CELL_DEG = 0.05
 FEATURES.extend(["shift", "depot"])
+FEATURES.append("routecached")      # /v1/route?id=..&cached=1: from this computer only (0.10.1)
 
 
 class Shifts:
@@ -2431,11 +2437,17 @@ def make_handler(service, port):
                     text, cached = service.nearby(lat, lon)
                 elif u.path == "/v1/route":
                     rid = int(q["id"][0])
+                    offline = q.get("cached", ["0"])[0] == "1"     # a background load: this computer only, at once
                     if GTFS_ROUTE <= rid < GTFS_NODE:
-                        text, cached = service.gtfs_route(rid), False
+                        text, cached = service.gtfs_route(rid, offline=offline), False
                         return self.send_json(200, b'{"ok":true,"cached":false,"data":' + text.encode("utf-8") + b"}")
                     if not 0 < rid < 10 ** 12:
                         return self.fail(400, "id out of range")
+                    if offline:
+                        text = service.cache.get(route_key(rid))[0] or service.cache.get(f"route_{rid}")[0]
+                        if text is None:
+                            return self.fail(404, "not on this computer")
+                        return self.send_json(200, b'{"ok":true,"cached":true,"data":' + service.with_limits(text).encode("utf-8") + b"}")
                     try:
                         text, cached = service.get(route_key(rid), route_query(rid))
                     except RuntimeError as e:
