@@ -45,7 +45,7 @@ import urllib.request
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 APP = "earth-bus-routes-data"
 PORT = 47630
 UA = f"{APP}/{VERSION} (+https://github.com/Robitnik/earth-bus-routes)"   # Overpass refuses clients without one
@@ -1310,6 +1310,10 @@ class Gtfs:
     def status(self):
         return {"countries": sorted(self.feeds), "state": self.state, "ready": sorted(self.dbs)}
 
+    def coming(self, countries):
+        """Are the timetables of one of these countries being downloaded or prepared right now?"""
+        return any(cc in self._building for cc in countries)
+
     # -- queries --
 
     def _stops_near(self, db, lat, lon, radius):
@@ -1781,6 +1785,11 @@ class Service:
                 text, cached, partial = None, False, True
         if found and found["lines"]:
             text = merge_gtfs(text, found, partial)
+        elif self.gtfs.enabled and self.places.base and self.gtfs.coming(self.places.countries_near(lat, lon)):
+            # the timetables of this country are on their way (a minute): the answer is marked so the mod asks again
+            data = json.loads(text)
+            data["partial"] = True
+            text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
         return text, cached
 
     def lines(self, ref, lat, lon, local=False):
