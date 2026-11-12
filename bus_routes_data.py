@@ -46,6 +46,8 @@ import json
 import os
 import pathlib
 import re
+import select
+import socket
 import sys
 import threading
 import unicodedata
@@ -56,7 +58,7 @@ import urllib.request
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.10.1"
+VERSION = "0.10.3"
 APP = "earth-bus-routes-data"
 PORT = 47630
 UA = f"{APP}/{VERSION} (+https://github.com/Robitnik/earth-bus-routes)"   # Overpass refuses clients without one
@@ -72,6 +74,9 @@ RADIUS_M = 650
 MIN_GAP_S = 1.0                   # between two requests to the public servers (their usage policy asks for restraint)
 BACKOFF_S = (1.0, 3.0, 8.0)
 TIMEOUT_S = 45                   # a public server that takes longer is overloaded: try the next one
+BUDGET_S = 90                    # one request to the public servers, its wait in the queue included, never takes longer
+LEASE_S = 25                     # a map answer fetched for nobody in particular (the partial nearby) goes on this long after
+                                 # the last time somebody asked for it (the open menu asks again every 10 s)
 MAX_BYTES = 12 * 1024 * 1024
 MODES = "^(bus|trolleybus|minibus|share_taxi)$"
 PHOTON = "https://photon.komoot.io/api/"
@@ -612,7 +617,55 @@ class Activity:
 
 
 ACTIVITY = Activity()
-CURRENT = threading.local()                  # the cache key of the request this thread is serving: the label of its progress
+CURRENT = threading.local()                  # the cache key of the request this thread is serving: the label of its progress;
+                                             # .wanted: does the game still wait for this thread's answer (its connection)
+
+
+class Abandoned(RuntimeError):
+    """Nobody waits for the answer any more (the game closed the connection, the menu was closed): no new request is sent."""
+
+
+class Interest:
+    """The keys somebody asked for lately (a lease of LEASE_S): a fetch nobody waits for directly (the partial nearby) goes on
+    while the open menu keeps asking, and stops when it does not."""
+
+    def __init__(self, clock=time.monotonic):
+        self._lock = threading.Lock()
+        self._until = {}
+        self.clock = clock
+
+    def touch(self, key, seconds=None):
+        with self._lock:
+            self._until[key] = self.clock() + (LEASE_S if seconds is None else seconds)
+
+    def alive(self, key):
+        with self._lock:
+            return self._until.get(key, 0) > self.clock()
+
+
+INTEREST = Interest()
+
+
+def client_gone(sock):
+    """Has the other end closed this connection? (A GET sends nothing more after its headers: readable means closed.)"""
+    try:
+        r, _, _ = select.select([sock], [], [], 0)
+        if not r:
+            return False
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except (OSError, ValueError):
+        return True
+
+
+def still_wanted():
+    """For the public-server loops: False once nobody waits for this thread's answer (no check outside a request: True)."""
+    w = getattr(CURRENT, "check", None)
+    if w is None:
+        return True
+    try:
+        return bool(w())
+    except Exception:
+        return True
 
 
 def label_of(key):
@@ -1793,7 +1846,8 @@ class Cache:
 def post_overpass(url, query):
     req = urllib.request.Request(url, data=urllib.parse.urlencode({"data": query}).encode(),
                                  headers={"User-Agent": UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
+    timeout = getattr(CURRENT, "attempt_timeout", None) or TIMEOUT_S        # (what is left of the request's budget)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         body = r.read(MAX_BYTES + 1)
     if len(body) > MAX_BYTES:
         raise ValueError("answer too large")
@@ -1813,11 +1867,31 @@ def fetch_upstream(query, mirrors=None, sender=None, sleep=time.sleep, clock=tim
         ACTIVITY.end(token)
 
 
+def _wait_turn(deadline, clock):
+    """The one request at a time to the public servers: waits for its turn, but not when nobody waits any more for the
+    answer, nor past the budget."""
+    while not _lock.acquire(timeout=0.25):
+        if not still_wanted():
+            raise Abandoned("nobody waits for it any more (it was still in the queue)")
+        if clock() >= deadline:
+            raise RuntimeError(f"the public servers were busy for {BUDGET_S} s (still in the queue)")
+
+
 def _fetch_upstream(query, mirrors, sender, sleep, clock, rounds, errors, token):
     global _last_call
-    with _lock:
+    deadline = clock() + BUDGET_S
+    _wait_turn(deadline, clock)
+    try:
         for n, url in enumerate(mirrors * rounds):
-            ACTIVITY.update(token, state="running", mirror=n % len(mirrors) + 1, of=len(mirrors))             # every mirror twice (once for a request somebody waits long for), a longer wait between
+            # each mirror twice at most, within the budget, and only while somebody waits for the answer
+            if not still_wanted():
+                raise Abandoned("nobody waits for it any more")
+            left = deadline - clock()
+            if left < 5:
+                errors.append(f"the {BUDGET_S} s limit")
+                break
+            CURRENT.attempt_timeout = min(TIMEOUT_S, left)
+            ACTIVITY.update(token, state="running", mirror=n % len(mirrors) + 1, of=len(mirrors))
             gap = MIN_GAP_S - (clock() - _last_call)
             if gap > 0:
                 sleep(gap)
@@ -1835,6 +1909,9 @@ def _fetch_upstream(query, mirrors, sender, sleep, clock, rounds, errors, token)
                 _last_call = clock()
                 errors.append(f"{urllib.parse.urlsplit(url).hostname}: {type(e).__name__}")
             sleep(BACKOFF_S[min(n, len(BACKOFF_S) - 1)])
+    finally:
+        CURRENT.attempt_timeout = None
+        _lock.release()
     raise RuntimeError("; ".join(errors[-4:]) or "no mirror")
 
 
@@ -1856,7 +1933,13 @@ def fetch_osrm(pts, bases=None, getter=None, sleep=time.sleep):
 def _fetch_osrm(pts, bases, getter, sleep, token):
     getter = getter or get_url
     errors = []
+    start = time.monotonic()
     for n, base in enumerate((bases or OSRM) * 2):
+        if n and not still_wanted():
+            raise Abandoned("nobody waits for it any more")
+        if time.monotonic() - start > BUDGET_S:
+            errors.append(f"the {BUDGET_S} s limit")
+            break
         ACTIVITY.update(token, state="running", mirror=n % len(bases or OSRM) + 1, of=len(bases or OSRM))
         host = urllib.parse.urlsplit(base).hostname
         try:
@@ -1882,7 +1965,7 @@ class Service:
         # the stops along a road are a big query: one round of mirrors, so the answer comes (or fails) before the mod stops waiting
         self.upstream_once = (lambda q: fetch_upstream(q, rounds=1)) if upstream is fetch_upstream else upstream
         self.started = time.time()
-        self.served = {"cached": 0, "fetched": 0, "stale": 0, "failed": 0}
+        self.served = {"cached": 0, "fetched": 0, "stale": 0, "failed": 0, "dropped": 0}
         self.index = StopIndex()
         self.indexed = 0
 
@@ -1969,22 +2052,31 @@ class Service:
                 "lines": sorted(m[3], key=by_number)[:24]} for i, m in enumerate(merged[:limit])]
         return {"stops": out, "timetables": self.gtfs.ready()}
 
-    def nearby(self, lat, lon):
+    def nearby(self, lat, lon, offline=False):
         """(text, cached): the stops and lines around a point: OpenStreetMap's (kept per cell) with the timetables' lines
-        merged in; the timetables alone while no map server answers."""
-        self.want_timetables(lat, lon)
+        merged in; the timetables alone while no map server answers. `offline`: only what this computer has (a background
+        load of the mod: never a public server); None when it has nothing."""
+        if not offline:
+            self.want_timetables(lat, lon)
         found = self.gtfs.lines_near(snap(lat), snap(lon), RADIUS_M) if self.gtfs.ready() else None
         key, query = nearby_key(lat, lon), nearby_query(snap(lat), snap(lon))
         have, age = self.cache.get(key)
         partial = False
+        if offline:
+            if have is None and not (found and found["lines"]):
+                return None, True
+            text = merge_gtfs(have, found, have is None) if found and found["lines"] else have
+            return text, True
         if not found or not found["lines"] or (have is not None and age is not None and age < self.ttl):
             text, cached = self.get(key, query, post=slim_nearby)
         else:
             # the timetables are here, the map server may be slow: wait for it a few seconds, then answer with the timetables
             # alone (marked "partial": the mod does not keep such an answer) while the map's answer goes on being fetched
             box = {}
+            INTEREST.touch(key)              # nobody waits on this fetch: it goes on while the menu keeps asking
 
             def work():
+                CURRENT.wanted = lambda: False
                 try:
                     box["v"] = self.get(key, query, post=slim_nearby)
                 except RuntimeError as e:
@@ -2142,8 +2234,17 @@ class Service:
                 self.served["cached"] += 1
                 return text, True
             CURRENT.label = key
+            # wanted while the game waits on this thread's connection, or while somebody asked for this key lately
+            outer = getattr(CURRENT, "wanted", None)
+            CURRENT.check = (lambda: INTEREST.alive(key) or outer()) if outer else None
             try:
                 fresh = (upstream or self.upstream)(query)
+            except Abandoned as e:
+                self.served["dropped"] += 1
+                say(f"{key}: dropped: {e}")
+                if text is not None:
+                    return text, True
+                raise
             except RuntimeError as e:
                 if text is not None:
                     self.served["stale"] += 1
@@ -2152,6 +2253,8 @@ class Service:
                 self.served["failed"] += 1
                 say(f"{key}: failed: {e}")
                 raise
+            finally:
+                CURRENT.check = None
             if post:
                 fresh = post(fresh)
             self.cache.put(key, fresh)
@@ -2190,7 +2293,8 @@ SHIFT_MAX_MINS = 720
 DEPOT_RADIUS_M = 10000
 DEPOT_CELL_DEG = 0.05
 FEATURES.extend(["shift", "depot"])
-FEATURES.append("routecached")      # /v1/route?id=..&cached=1: from this computer only (0.10.1)
+FEATURES.append("routecached")
+FEATURES.append("nearbycached")    # /v1/nearby?..&cached=1: from this computer only (0.10.3)      # /v1/route?id=..&cached=1: from this computer only (0.10.1)
 
 
 class Shifts:
@@ -2378,6 +2482,14 @@ def make_handler(service, port):
             self.send_json(code, json.dumps({"ok": False, "error": msg}))
 
         def do_GET(self):
+            # while this request is served, the public-server loops ask whether the game still waits for it
+            CURRENT.wanted = lambda: not client_gone(self.connection)
+            try:
+                return self._get()
+            finally:
+                CURRENT.wanted = None
+
+        def _get(self):
             if not host_ok(self.headers.get("Host"), port):
                 return self.fail(403, "wrong Host")
             u = urllib.parse.urlsplit(self.path)
@@ -2434,7 +2546,12 @@ def make_handler(service, port):
                     lat, lon = float(q["lat"][0]), float(q["lon"][0])
                     if not (-85 <= lat <= 85 and -180 <= lon <= 180):
                         return self.fail(400, "lat / lon out of range")
-                    text, cached = service.nearby(lat, lon)
+                    if q.get("cached", ["0"])[0] == "1":            # a background load: this computer only, at once
+                        text, cached = service.nearby(lat, lon, offline=True)
+                        if text is None:
+                            return self.fail(404, "not on this computer")
+                    else:
+                        text, cached = service.nearby(lat, lon)
                 elif u.path == "/v1/route":
                     rid = int(q["id"][0])
                     offline = q.get("cached", ["0"])[0] == "1"     # a background load: this computer only, at once
