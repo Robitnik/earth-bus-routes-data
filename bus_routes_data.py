@@ -52,6 +52,7 @@ import math
 import json
 import os
 import pathlib
+import datetime
 import re
 import select
 import socket
@@ -65,7 +66,7 @@ import urllib.request
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 APP = "earth-bus-routes-data"
 PORT = 47630
 UA = f"{APP}/{VERSION} (+https://github.com/Robitnik/earth-bus-routes)"   # Overpass refuses clients without one
@@ -1862,6 +1863,16 @@ DB_TILES_IN_MEMORY = 48
 DB_TWIN_M = 30                            # a stop this near the road, not listed by the line, is on the road (the other side)
 DB_TWIN_TILES = 6                         # ... looked for when the line spans no more tiles than this
 DB_WAY_ID = 7 * 10 ** 12                  # ids of the made-up ways of an answer made from a database line (only used as keys)
+SOURCES = ("auto", "db", "live")
+
+
+def parse_src(q):
+    """The source choice of a request (?src=): 'auto' (the database where it has the place, else the live servers), 'db' (only the
+    database: a place it lacks stays empty), 'live' (only the live servers and timetables: the old way)."""
+    v = (q.get("src") or ["auto"])[0]
+    return v if v in SOURCES else "auto"
+
+
 DB_ROUTE_MIN = 3 * 10 ** 12               # line ids from here up exist only in the database
 FEATURES = FEATURES + ["routedb"]
 
@@ -2175,6 +2186,15 @@ class RouteDb:
                 elements.append({"type": "node", "id": s["s"], "lat": s["la"], "lon": s["lo"], "tags": self.stop_tags(st)})
         tags = dict(rec["t"])
         tags.update({"type": "route", "route": rec.get("mode", "bus"), "bus_routes:source": "routedb"})
+        # where the line comes from (the menu shows it): the kinds of source ("osm+gtfs+edit"), the timetable feeds and their licences
+        src = rec.get("src") or []
+        parts = [k for k in dict.fromkeys(x.get("k") for x in src) if k]
+        if parts:
+            tags["bus_routes:parts"] = "+".join(parts)
+        for tag, key in (("bus_routes:feeds", "feed"), ("bus_routes:lic", "lic")):
+            vals = sorted({str(x[key]) for x in src if x.get("k") == "gtfs" and x.get(key)})
+            if vals:
+                tags[tag] = ", ".join(vals)
         rel = {"type": "relation", "id": rid, "members": members, "tags": tags}
         times = rec.get("times")
         if times and all("o" in s for s in stops):
@@ -2208,6 +2228,24 @@ class RouteDb:
                 if dist_to_path(st["lat"], st["lon"], path) <= DB_TWIN_M:
                     out.append({"type": "node", "id": st["id"], "lat": st["lat"], "lon": st["lon"], "tags": self.stop_tags(st)})
         return out
+
+    def locate(self, lat, lon, name="", radius_m=40.0, online=True):
+        """(country code or None, the stop of the database at this place or None): the country of the nearest stop of the tiles at the
+        place (a line over a border leaves its stops in the other country's tiles: the nearest one is the country of the place);
+        the stop itself when it lies within `radius_m` (one of the same name within half as much again)."""
+        cc, best, near = None, None, None
+        for key in self._tiles(lat - 0.0002, lon - 0.0002, lat + 0.0002, lon + 0.0002, online):
+            t = self.tile(key, online)
+            if t is None:
+                continue
+            for st in t.get("stops", ()):
+                dd = _dist_m(lat, lon, st["lat"], st["lon"])
+                if near is None or dd < near[0]:
+                    near = (dd, key[1])
+                same = bool(name) and fold(st.get("n") or "") == fold(name)
+                if dd <= radius_m * (1.5 if same else 1.0) and (best is None or dd * (0.6 if same else 1.0) < best[0]):
+                    best, cc = (dd * (0.6 if same else 1.0), st), key[1]
+        return (cc or (near[1] if near else None)), (best[1] if best else None)
 
     def status(self):
         out = []
@@ -2344,6 +2382,30 @@ def _fetch_osrm(pts, bases, getter, sleep, token):
     raise RuntimeError("; ".join(errors[-3:]) or "no routing server")
 
 
+EXPORT_MAX_POINTS = 80
+EXPORT_ROUTE_BASE = 3 * 10 ** 12          # the id bands of the route database (builder/ebrdb/ids.py)
+EXPORT_STOP_BASE = 6 * 10 ** 12
+
+
+def stable_hash(text):
+    return int(hashlib.sha1(text.encode("utf-8")).hexdigest()[:12], 16) % 10 ** 11
+
+
+def polyline_encode(points):
+    """[(lat, lon)] -> Google polyline, precision 1e-5."""
+    out, pa, po = [], 0, 0
+    for lat, lon in points:
+        a, o = round(lat * 1e5), round(lon * 1e5)
+        for v in (a - pa, o - po):
+            v = ~(v << 1) if v < 0 else v << 1
+            while v >= 0x20:
+                out.append(chr((0x20 | (v & 0x1F)) + 63))
+                v >>= 5
+            out.append(chr(v + 63))
+        pa, po = a, o
+    return "".join(out)
+
+
 class Service:
     def __init__(self, cache, upstream=fetch_upstream, ttl=TTL_S, router=fetch_osrm, geocoder=geo_search, places=None, gtfs=None,
                  db=None, live=False):
@@ -2443,16 +2505,22 @@ class Service:
                 "lines": sorted(m[3], key=by_number)[:24]} for i, m in enumerate(merged[:limit])]
         return {"stops": out, "timetables": self.gtfs.ready()}
 
-    def nearby(self, lat, lon, offline=False):
+    def uses_db(self, src="auto"):
+        """Does a request with this source choice read the route database?"""
+        return self.db.enabled and (src == "db" or (src == "auto" and not self.live))
+
+    def nearby(self, lat, lon, offline=False, src="auto"):
         """(text, cached): the stops and lines around a point: OpenStreetMap's (kept per cell) with the timetables' lines
         merged in; the timetables alone while no map server answers. `offline`: only what this computer has (a background
         load of the mod: never a public server); None when it has nothing.
         Where the route database has the place it answers (lines and stops prepared in advance, the real timetables' times
         in them): nothing is asked of the map servers and no timetables are downloaded."""
-        if self.db.enabled and not self.live:
+        if self.uses_db(src):
             text = self.db.nearby(snap(lat), snap(lon), RADIUS_M, online=True)
             if text is not None:
                 return text, True
+            if src == "db":                  # only the database was asked for: a place it lacks has nothing
+                return '{"elements":[]}', True
         if not offline:
             self.want_timetables(lat, lon)
         found = self.gtfs.lines_near(snap(lat), snap(lon), RADIUS_M) if self.gtfs.ready() else None
@@ -2545,9 +2613,9 @@ class Service:
         except (ValueError, KeyError, TypeError, StopIteration):
             return text
 
-    def road_through(self, points, offline=False):
+    def road_through(self, points, offline=False, fallback=None):
         """The road through stops, [(lat, lon), ...]: the routing servers' (asked in windows of 24 stops, each kept), or when
-        `offline` only roads already kept; straight lines where there is none."""
+        `offline` only roads already kept; straight lines where there is none (`fallback`, a list, gets an item for each such window)."""
         stops = [(round(a, 6), round(b, 6)) for a, b in points]
         road, window, i = [], 24, 0
         while i < len(stops) - 1:
@@ -2559,11 +2627,83 @@ class Service:
                 else:
                     p, _ = self.path(pts)
                     seg = [(a, b) for a, b in p["points"]]
+                    if p.get("source") != "osrm" and fallback is not None:
+                        fallback.append(i)
             else:
                 seg = pts
+                if fallback is not None:
+                    fallback.append(i)
             road += seg if not road else seg[1:]
             i += window - 1
         return road
+
+    def export_route(self, d):
+        """Writes a hand-made line (the mod's route builder: stops with names and places) as files for the hand-made layer of the route
+        database (edits/<CC>/new/<line>.json and edits/<CC>/stops.json), into <cache>/../export/<CC>/: the stops that the database has
+        keep their ids, the road is the one the routing server gives. Returns what was written. ValueError for bad input."""
+        pts = d.get("points") if isinstance(d, dict) else None
+        if not isinstance(pts, list) or not 2 <= len(pts) <= EXPORT_MAX_POINTS:
+            raise ValueError(f"a line needs 2 to {EXPORT_MAX_POINTS} stops")
+        clean = []
+        for p in pts:
+            try:
+                lat, lon = float(p["lat"]), float(p["lon"])
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("a stop has no place")
+            if not (-85 <= lat <= 85 and -180 <= lon <= 180):
+                raise ValueError("a stop is out of range")
+            clean.append({"name": str(p.get("name") or "")[:120], "lat": round(lat, 6), "lon": round(lon, 6)})
+        ref = re.sub(r"[^\w\-/ ]", "", str(d.get("ref") or "")).strip()[:6] or "My"
+        first, last = clean[0]["name"], clean[-1]["name"]
+        name = str(d.get("name") or "")[:120] or f"{ref}: {first} - {last}"
+        cc, new_stops, stop_list, matched = None, {}, [], 0
+        for p in clean:
+            c, st = self.db.locate(p["lat"], p["lon"], p["name"])
+            cc = cc or c
+            if st is not None:
+                sid, matched = st["id"], matched + 1
+            else:
+                sid = EXPORT_STOP_BASE + stable_hash(f"hand|{p['name']}|{p['lat']:.5f}|{p['lon']:.5f}")
+                new_stops[str(sid)] = {"n": p["name"], "lat": p["lat"], "lon": p["lon"], "k": "p"}
+            stop_list.append({"s": sid})
+        cc = cc or "ZZ"
+        try:
+            straight = []
+            road = self.road_through([(p["lat"], p["lon"]) for p in clean], False, straight)
+            if straight:
+                raise RuntimeError("the routing server did not answer for all of it")
+        except Exception as e:           # (no routing server: the line has no road, the service asks for one when it is used)
+            say(f"export: no road ({e})")
+            road = None
+        ways = [{"g": polyline_encode(simplify(road, 2.0))}] if road and len(road) >= 2 else []
+        tags = {"ref": ref, "name": name, "from": first, "to": last, "route": "bus", "public_transport:version": "2"}
+        if re.match(r"^#[0-9a-fA-F]{6}$", str(d.get("colour") or "")):
+            tags["colour"] = d["colour"].lower()
+        rid = EXPORT_ROUTE_BASE + stable_hash(f"hand|{ref}|{name}|{first}|{last}")
+        rec = {"v": 1, "id": rid, "cc": cc, "mode": "bus", "t": tags, "ways": ways, "stops": stop_list,
+               "src": [{"k": "edit", "by": "export", "date": datetime.date.today().isoformat()}]}
+        base = self.cache.dir.parent / "export" / cc
+        (base / "new").mkdir(parents=True, exist_ok=True)
+        files = []
+        line_file = base / "new" / (re.sub(r"[^A-Za-z0-9_-]", "_", ref) + f"_{rid}.json")
+        line_file.write_text(json.dumps(rec, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        files.append(str(line_file))
+        if new_stops:
+            sf = base / "stops.json"
+            try:
+                have = json.loads(sf.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                have = {}
+            have.update(new_stops)
+            sf.write_text(json.dumps(have, ensure_ascii=False, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+            files.append(str(sf))
+        (base.parent / "README.txt").write_text(
+            "Lines made by hand, written by the Earth Bus Routes data service in the shape of the hand-made layer of the route database\n"
+            "(https://github.com/Robitnik/earth-bus-routes-db-eu). To add them to the database, copy <CC>/new/*.json and merge\n"
+            "<CC>/stops.json into edits/<CC>/ of that repository and open a pull request (see docs/FORMAT.md, Edits). The country\n"
+            "code is the one of the nearest known stop (ZZ when the place is not in the database yet: rename the folder).\n", encoding="utf-8")
+        return {"cc": cc, "id": rid, "folder": str(base), "files": files, "stops": len(stop_list), "matched": matched,
+                "new_stops": len(new_stops), "road": bool(ways)}
 
     def db_route(self, rid, offline=False):
         """The route answer of a line of the route database (None when it is not there), with the towns round its road."""
@@ -2701,6 +2841,7 @@ DEPOT_RADIUS_M = 10000
 DEPOT_CELL_DEG = 0.05
 FEATURES.extend(["shift", "depot"])
 FEATURES.append("routecached")
+FEATURES.extend(["source", "export"])        # ?src=auto|db|live on nearby and route (0.12); POST /v1/export (0.12)
 FEATURES.append("nearbycached")    # /v1/nearby?..&cached=1: from this computer only (0.10.3)      # /v1/route?id=..&cached=1: from this computer only (0.10.1)
 
 
@@ -2896,6 +3037,29 @@ def make_handler(service, port):
             finally:
                 CURRENT.wanted = None
 
+        def do_POST(self):
+            """POST /v1/export: a hand-made line as files for the hand-made layer of the route database. JSON only (a web page cannot send
+            that to this computer without a permission this service never gives)."""
+            if not host_ok(self.headers.get("Host"), port):
+                return self.fail(403, "wrong Host")
+            u = urllib.parse.urlsplit(self.path)
+            if u.path != "/v1/export":
+                return self.fail(404, "unknown request")
+            if "application/json" not in (self.headers.get("Content-Type") or ""):
+                return self.fail(415, "JSON only")
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                if not 0 < n <= 256 * 1024:
+                    return self.fail(413, "body too large")
+                body = json.loads(self.rfile.read(n).decode("utf-8"))
+                ans = service.export_route(body)
+            except (ValueError, UnicodeDecodeError) as e:
+                return self.fail(400, str(e))
+            except Exception as e:
+                say(f"export failed: {e!r}")
+                return self.fail(500, "export failed")
+            return self.send_json(200, json.dumps({"ok": True, "data": ans}, ensure_ascii=False))
+
         def _get(self):
             if not host_ok(self.headers.get("Host"), port):
                 return self.fail(403, "wrong Host")
@@ -2956,21 +3120,25 @@ def make_handler(service, port):
                     lat, lon = float(q["lat"][0]), float(q["lon"][0])
                     if not (-85 <= lat <= 85 and -180 <= lon <= 180):
                         return self.fail(400, "lat / lon out of range")
+                    src = parse_src(q)
                     if q.get("cached", ["0"])[0] == "1":            # a background load: this computer only, at once
-                        text, cached = service.nearby(lat, lon, offline=True)
+                        text, cached = service.nearby(lat, lon, offline=True, src=src)
                         if text is None:
                             return self.fail(404, "not on this computer")
                     else:
-                        text, cached = service.nearby(lat, lon)
+                        text, cached = service.nearby(lat, lon, src=src)
                 elif u.path == "/v1/route":
                     rid = int(q["id"][0])
                     offline = q.get("cached", ["0"])[0] == "1"     # a background load: this computer only, at once
-                    if service.db.enabled and not service.live and (rid >= DB_ROUTE_MIN or rid < GTFS_ROUTE):
+                    src = parse_src(q)
+                    if service.uses_db(src) and (rid >= DB_ROUTE_MIN or rid < GTFS_ROUTE):
                         text = service.db_route(rid, offline)
                         if text is not None:
                             return self.send_json(200, b'{"ok":true,"cached":true,"data":' + text.encode("utf-8") + b"}")
-                        if rid >= DB_ROUTE_MIN:
+                        if rid >= DB_ROUTE_MIN or src == "db":
                             return self.fail(404, "no such line in the route database")
+                    elif src == "live" and rid >= DB_ROUTE_MIN:
+                        return self.fail(404, "this line is only in the route database")
                     if GTFS_ROUTE <= rid < GTFS_NODE:
                         text, cached = service.gtfs_route(rid, offline=offline), False
                         return self.send_json(200, b'{"ok":true,"cached":false,"data":' + text.encode("utf-8") + b"}")

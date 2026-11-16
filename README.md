@@ -22,7 +22,8 @@ Next to its cache (`%LOCALAPPDATA%\earth-bus-routes` on Windows):
   the places you play in (a few KB to a few hundred KB each) and the lines you open are downloaded and kept; nothing is fetched
   while the menu is closed. Where the database has the place, Overpass is not asked at all. To turn it off start the service with
   `BNE_BUSDATA_DB=0`; `BNE_BUSDATA_DB=<folder>` reads a copy on this computer (hand-edited lines), `BNE_BUSDATA_LIVE=1` asks the
-  live servers first (the old way).
+  live servers first (the old way). The menu of the mod has a drop-down for it too (`?src=auto|db|live` on `/v1/nearby` and `/v1/route`).
+  `POST /v1/export` writes a route the player built, as files for the database's hand-made layer, into `export/` next to the cache.
 - **Answers of OpenStreetMap** (Overpass), the routing server (OSRM) and the geocoder (Photon), kept for a week.
 
 Map data (c) OpenStreetMap contributors, ODbL (the route database is a derivative database, ODbL; its timetable feeds and their
