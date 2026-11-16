@@ -24,6 +24,7 @@ bus stops and bus routes the mod wants, keeps the answers on disk and hands them
                                         midnight), then the trips that follow it for `mins` minutes (chained at the termini)
   GET /v1/depot?lat=..&lon=..           the bus depot within 10 km of a point, else the nearest bus station: {"depot": {..} | null}
   GET /v1/status                        what it did lately (for the Add-ons page's log)
+  GET /v1/db                            the state of the route database (lines and stops prepared in advance, see below)
   GET /v1/connections?sid=..|lat=..&lon=..&t=..&day=..&win=8[&ref=..]
                                         the lines arriving at a stop (and the stops within 150 m of it) within +-win minutes of
                                         t (seconds from midnight) on weekday day (1 Monday .. 7 Sunday), for transfers; the
@@ -34,6 +35,12 @@ bus stops and bus routes the mod wants, keeps the answers on disk and hands them
                                         /v1/route), ref, head, from, to, offs}], "trips": [{pid, start}]}. Timetables only.
 
 Every answer is {"ok": true, "cached": bool, "data": <Overpass JSON>} or {"ok": false, "error": "..."}.
+
+The route database (github.com/Robitnik/earth-bus-routes-db-eu, JSON files on GitHub, ODbL) holds the bus lines and stops of whole
+countries prepared in advance, with the timetables' times of a typical day. Where it has a place, /v1/nearby and /v1/route answer
+from it (one small file each, no map server asked, no timetables downloaded). Elsewhere, and with BNE_BUSDATA_LIVE=1, the old way
+(Overpass, timetables, routing servers) is used. BNE_BUSDATA_DB=0 turns the database off; BNE_BUSDATA_DB=<folder or URL>[;..]
+points to another copy (a folder on this computer for hand-edited data).
 Run it from BeamNG.Earth's Add-ons page (a "companion"), or by hand: python bus_routes_data.py [--port N] [--cache DIR]
 
 Map data (c) OpenStreetMap contributors, ODbL. Towns (c) GeoNames, CC BY 4.0. Standard library only. MIT licence.
@@ -58,7 +65,7 @@ import urllib.request
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.10.3"
+VERSION = "0.11.0"
 APP = "earth-bus-routes-data"
 PORT = 47630
 UA = f"{APP}/{VERSION} (+https://github.com/Robitnik/earth-bus-routes)"   # Overpass refuses clients without one
@@ -1151,10 +1158,11 @@ def fold_words(text):
     return " ".join(re.findall(r"\w+", fold(text)))
 
 
-def build_gtfs_index(zip_path, db_path, today, days=GTFS_DAYS, progress=None):
+def build_gtfs_index(zip_path, db_path, today, days=GTFS_DAYS, progress=None, ref_fn=None):
     """Index a GTFS zip into an sqlite file: stops, the patterns (one line's one way of going: its stops with their times
     from the start) with how many trips run on the next `days` days from `today` (a datetime.date), and the departures with a
-    bit per day. Streams the files: stop_times.txt is a gigabyte for a country. Returns {stops, patterns, trips}."""
+    bit per day. Streams the files: stop_times.txt is a gigabyte for a country. Returns {stops, patterns, trips}.
+    `ref_fn(route_short_name, route_long_name)` gives the number of a line (default gtfs_ref: made for the Czech national feed)."""
     import csv
     import datetime
     import sqlite3
@@ -1181,7 +1189,7 @@ def build_gtfs_index(zip_path, db_path, today, days=GTFS_DAYS, progress=None):
     r, ix = reader("routes.txt")
     for row in r:
         if _bus_route(col(ix, row, "route_type")):
-            ref = gtfs_ref(col(ix, row, "route_short_name"), col(ix, row, "route_long_name"))
+            ref = (ref_fn or gtfs_ref)(col(ix, row, "route_short_name"), col(ix, row, "route_long_name"))
             routes[col(ix, row, "route_id")] = (ref, col(ix, row, "route_long_name"), agencies.get(col(ix, row, "agency_id"), ""))
     say_p("trips", 0.04)
     trips, services = {}, set()
@@ -1841,6 +1849,386 @@ class Cache:
         os.replace(tmp, self.path(key))
 
 
+# ---- the route database: lines and stops prepared in advance (github.com/Robitnik/earth-bus-routes-db-eu) ---------------------
+
+DB_REPOS = [["https://raw.githubusercontent.com/Robitnik/earth-bus-routes-db-eu/main",
+             "https://cdn.jsdelivr.net/gh/Robitnik/earth-bus-routes-db-eu@main"]]      # a repo = its mirrors, tried in this order
+DB_TIMEOUT_S = 10
+DB_MAX_BYTES = 8 * 1024 * 1024
+DB_MANIFEST_TTL_S = 86400                 # the database is rebuilt monthly: a day is plenty
+DB_MANIFEST_RETRY_S = 600                 # after a failure (offline, repo not there) it is left alone this long
+DB_FILE_TTL_S = 14 * 86400
+DB_TILES_IN_MEMORY = 48
+DB_TWIN_M = 30                            # a stop this near the road, not listed by the line, is on the road (the other side)
+DB_TWIN_TILES = 6                         # ... looked for when the line spans no more tiles than this
+DB_WAY_ID = 7 * 10 ** 12                  # ids of the made-up ways of an answer made from a database line (only used as keys)
+DB_ROUTE_MIN = 3 * 10 ** 12               # line ids from here up exist only in the database
+FEATURES = FEATURES + ["routedb"]
+
+
+def db_fetch(url):
+    """The text of a file of the database, or None when the server says it is not there (404). Other errors raise OSError."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Encoding": "identity"})
+    try:
+        with urllib.request.urlopen(req, timeout=DB_TIMEOUT_S) as r:
+            body = r.read(DB_MAX_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise OSError(f"HTTP {e.code} from {url}") from e
+    except urllib.error.URLError as e:
+        raise OSError(str(e.reason)) from e
+    if len(body) > DB_MAX_BYTES:
+        raise OSError("file too big")
+    return body.decode("utf-8")
+
+
+class DbRepo:
+    """One repository of the database: a folder on this computer (for development and for hand-edited copies) or mirrors of
+    one on the net. Files of the net are kept in the cache folder and used while they are fresh; a stale copy is used when the
+    net does not answer."""
+
+    def __init__(self, mirrors, cache_dir=None, fetch=db_fetch, clock=time.time):
+        self.mirrors, self.fetch, self.clock = list(mirrors), fetch, clock
+        self.local = [pathlib.Path(m) for m in self.mirrors if not str(m).startswith(("http://", "https://"))]
+        self.urls = [m.rstrip("/") for m in self.mirrors if str(m).startswith(("http://", "https://"))]
+        tag = hashlib.sha1("|".join(self.mirrors).encode("utf-8")).hexdigest()[:8]
+        self.dir = pathlib.Path(cache_dir) / "db" / tag if cache_dir else None
+        self.failed_at = 0.0
+        self._manifest = None
+        self._lock = threading.Lock()
+
+    def read(self, rel, ttl=DB_FILE_TTL_S, online=True):
+        """The text of the file `rel` ('data/CZ/tiles/1400_1944.json'), or None. `online` False: this computer only."""
+        for d in self.local:
+            f = d / rel
+            if f.is_file():
+                return f.read_text(encoding="utf-8")
+        if self.dir is None:
+            return None
+        f = self.dir / rel
+        stale = None
+        try:
+            age = self.clock() - f.stat().st_mtime
+            text = f.read_text(encoding="utf-8")
+            if age < ttl:
+                return text
+            stale = text
+        except OSError:
+            pass
+        if not online or not self.urls:
+            return stale
+        for base in self.urls:
+            try:
+                text = self.fetch(f"{base}/{rel}")
+            except OSError as e:
+                say(f"db: {rel}: {str(e)[:80]}")
+                continue
+            if text is None:
+                return stale
+            try:
+                f.parent.mkdir(parents=True, exist_ok=True)
+                tmp = f.with_name(f.name + ".part")
+                tmp.write_text(text, encoding="utf-8")
+                os.replace(tmp, f)
+            except OSError:
+                pass
+            return text
+        return stale
+
+    def manifest(self, online=True):
+        """The repo's manifest.json as a dict, or None (not there / not reachable)."""
+        with self._lock:
+            if self._manifest is not None and self.clock() - self._manifest[0] < DB_MANIFEST_TTL_S:
+                return self._manifest[1]
+            if self._manifest is None and self.failed_at and self.clock() - self.failed_at < DB_MANIFEST_RETRY_S:
+                return None
+            try:
+                text = self.read("manifest.json", ttl=DB_MANIFEST_TTL_S, online=online)
+                data = json.loads(text) if text else None
+            except (ValueError, OSError):
+                data = None
+            if not isinstance(data, dict) or not isinstance(data.get("countries"), dict):
+                if online:
+                    self.failed_at = self.clock()
+                return self._manifest[1] if self._manifest else None
+            self.failed_at = 0.0
+            self._manifest = (self.clock(), data)
+            return data
+
+
+def tile_index(lat, lon, deg):
+    return int(math.floor((lat + 90) / deg)), int(math.floor((lon + 180) / deg))
+
+
+def polyline_decode(text):
+    """Google polyline (precision 1e-5) -> [(lat, lon), ...]"""
+    pts, i, a, o = [], 0, 0, 0
+    while i < len(text):
+        vals = []
+        for _ in range(2):
+            shift = result = 0
+            while True:
+                b = ord(text[i]) - 63
+                i += 1
+                result |= (b & 0x1F) << shift
+                shift += 5
+                if b < 0x20:
+                    break
+            vals.append(~(result >> 1) if result & 1 else result >> 1)
+        a, o = a + vals[0], o + vals[1]
+        pts.append((a / 1e5, o / 1e5))
+    return pts
+
+
+class RouteDb:
+    """Lines and stops prepared in advance, answered in the shape of the Overpass answers the mod already reads (the same
+    shape the timetables' lines have): one small file of a tile of 0.1 degrees for "nearby", one file for a line."""
+
+    def __init__(self, repos=None):
+        self.repos = list(repos or [])
+        self._mem = {}                       # (repo index, country, tile name) -> tile dict (LRU by insertion order)
+        self._where = {}                     # line id -> (repo index, country): learnt from the tiles
+        self._sets = {}                      # (repo index, country) -> the names of its tiles
+        self.last = None                     # (lat, lon) of the last place a nearby answer was made for
+        self._lock = threading.RLock()
+
+    @property
+    def enabled(self):
+        return bool(self.repos)
+
+    def countries(self, online=True):
+        """[(repo index, country, manifest entry)]"""
+        out = []
+        for i, repo in enumerate(self.repos):
+            m = repo.manifest(online)
+            if m:
+                out += [(i, cc, e) for cc, e in sorted(m["countries"].items())]
+        return out
+
+    def _have(self, i, cc, e, online=True):
+        """The set of the tiles a country has: the manifest's own list (small databases) or its index file (data/<cc>/index.json,
+        fetched once and kept). None when the index cannot be had."""
+        have = self._sets.get((i, cc))
+        if have is not None:
+            return have
+        names = e.get("tiles")
+        if names is None:
+            text = self.repos[i].read(e.get("index") or f"data/{cc}/index.json", ttl=DB_MANIFEST_TTL_S, online=online)
+            try:
+                names = json.loads(text)["tiles"] if text else None
+            except (ValueError, KeyError, TypeError):
+                names = None
+            if names is None:
+                return None
+        have = self._sets[(i, cc)] = set(names)
+        return have
+
+    def _tiles(self, lat0, lon0, lat1, lon1, online=True):
+        """[(repo index, cc, tile name)] of the tiles that exist and touch the box. Only the countries whose bounding box touches
+        the box are looked into (one index file each, the first time)."""
+        out = []
+        for i, cc, e in self.countries(online):
+            bb = e.get("bbox")
+            if bb and (lat1 < bb[0] - 0.1 or lat0 > bb[2] + 0.1 or lon1 < bb[1] - 0.1 or lon0 > bb[3] + 0.1):
+                continue
+            have = self._have(i, cc, e, online)
+            if not have:
+                continue
+            deg = e.get("tile_deg", 0.1)
+            (ya, xa), (yb, xb) = tile_index(lat0, lon0, deg), tile_index(lat1, lon1, deg)
+            for y in range(ya, yb + 1):
+                for x in range(xa, xb + 1):
+                    if f"{y}_{x}" in have:
+                        out.append((i, cc, f"{y}_{x}"))
+        return out
+
+    def covers(self, lat, lon, online=True):
+        """The database knows this place: a tile at it or next to it exists."""
+        return bool(self._tiles(lat - 0.1, lon - 0.1, lat + 0.1, lon + 0.1, online))             # (a tile at it or next to it)
+
+    def tile(self, key, online=True):
+        with self._lock:
+            t = self._mem.pop(key, None)
+            if t is not None:
+                self._mem[key] = t
+                return t
+        i, cc, name = key
+        text = self.repos[i].read(f"data/{cc}/tiles/{name}.json", online=online)
+        if text is None:
+            return None
+        t = json.loads(text)
+        with self._lock:
+            self._mem[key] = t
+            while len(self._mem) > DB_TILES_IN_MEMORY:
+                self._mem.pop(next(iter(self._mem)))
+            for r in t.get("routes", ()):
+                self._where[r["id"]] = (i, cc)
+        return t
+
+    @staticmethod
+    def stop_tags(st):
+        tags = {"name": st["n"]} if st.get("n") else {}
+        k = st.get("k", "p")
+        if k == "s":
+            tags["amenity"] = "bus_station"
+        elif k == "x":
+            tags.update({"public_transport": "stop_position", "bus": "yes"})
+        else:
+            tags.update({"highway": "bus_stop", "public_transport": "platform", "bus": "yes"})
+        if st.get("ref"):
+            tags["ref"] = st["ref"]
+        if st.get("q"):
+            tags["request_stop"] = "yes"
+        if st.get("g"):
+            tags["bus_routes:source"] = "gtfs"
+        return tags
+
+    def nearby(self, lat, lon, radius=RADIUS_M, online=True):
+        """The text of a "nearby" answer (the stops within `radius` metres and the lines calling at them), or None when the
+        database does not know the place or a file is missing."""
+        dlat = radius / 110574 + 0.0005
+        dlon = radius / (111320 * max(0.2, math.cos(math.radians(lat)))) + 0.0005
+        keys = self._tiles(lat - dlat, lon - dlon, lat + dlat, lon + dlon, online)
+        if not keys:
+            return None
+        self.last = (lat, lon)
+        nodes, rels = {}, {}
+        for key in keys:
+            t = self.tile(key, online)
+            if t is None:
+                return None
+            for st in t["stops"]:
+                if st["id"] not in nodes and hav((lat, lon), (st["lat"], st["lon"])) <= radius:
+                    nodes[st["id"]] = {"type": "node", "id": st["id"], "lat": st["lat"], "lon": st["lon"], "tags": self.stop_tags(st)}
+            for r in t["routes"]:
+                e = rels.setdefault(r["id"], {"t": r["t"], "n": r["n"], "m": {}})
+                for item in r["s"]:
+                    e["m"][item[0]] = item
+        elements = list(nodes.values())
+        for rid in sorted(rels):
+            e = rels[rid]
+            members = []
+            for sid, item in e["m"].items():
+                if sid in nodes:
+                    m = {"type": "node", "ref": sid, "role": "", "i": item[1]}
+                    if len(item) > 2:
+                        m["j"] = item[2]
+                    members.append(m)
+            if not members:
+                continue
+            tags = dict(e["t"])
+            tags["type"] = "route"
+            tags.setdefault("route", "bus")
+            elements.append({"type": "relation", "id": rid, "tags": tags, "members": members, "n": e["n"],
+                             "ordered": tags.get("public_transport:version") == "2"})
+        return json.dumps({"elements": elements, "source": "routedb"}, separators=(",", ":"), ensure_ascii=False)
+
+    def find(self, rid, online=True):
+        """(repo index, cc, record) of a line, or None."""
+        rel = f"routes/{rid % 1000:03d}/{rid}.json"
+        known = self._where.get(rid)
+        if known:
+            order = [known]                 # a line seen in a tile is in that country
+        else:
+            # (a line asked for before any place was: the countries round the last place the database answered for, else all
+            # of them when there are only a few)
+            allc = self.countries(online)
+            last = self.last
+            near = [(i, cc) for i, cc, e in allc if not e.get("bbox") or last is None
+                    or (e["bbox"][0] - 0.2 <= last[0] <= e["bbox"][2] + 0.2 and e["bbox"][1] - 0.2 <= last[1] <= e["bbox"][3] + 0.2)]
+            order = near if (last is not None or len(allc) <= 4) else []
+        for i, cc in order:
+            text = self.repos[i].read(f"data/{cc}/{rel}", online=online)
+            if text is not None:
+                return i, cc, json.loads(text)
+        return None
+
+    def route(self, rid, road_for=None, online=True):
+        """The text of a route answer (as the one of Overpass: the relation with its ways' geometry and stops, then the nodes)
+        for a line of the database, or None. `road_for(points)` gives the road of a line that has none of its own (the
+        routing servers); without it the stops are joined by straight lines."""
+        got = self.find(rid, online)
+        if got is None:
+            return None
+        i, cc, rec = got
+        stops = rec["stops"]
+        members, elements, road, nid = [], [], [], DB_WAY_ID
+        for w in rec.get("ways", ()):
+            pts = [{"lat": a, "lon": b} for a, b in polyline_decode(w["g"])]
+            nid += 1
+            members.append({"type": "way", "ref": nid, "role": w.get("r", ""), "geometry": pts})
+            road += [(p["lat"], p["lon"]) for p in pts]
+            if w.get("t"):
+                elements.append({"type": "way", "id": nid, "tags": w["t"]})
+        if not rec.get("ways"):
+            pts = [(s["la"], s["lo"]) for s in stops]
+            road = road_for(pts) if road_for is not None else pts
+            nid += 1
+            members.append({"type": "way", "ref": nid, "role": "", "geometry": [{"lat": a, "lon": b} for a, b in road]})
+        seen = set()
+        for s in stops:
+            members.append({"type": "node", "ref": s["s"], "role": s.get("r", ""), "lat": s["la"], "lon": s["lo"]})
+            if s["s"] not in seen:
+                seen.add(s["s"])
+                st = {"n": s.get("n"), "k": "p", "q": s.get("q")}
+                elements.append({"type": "node", "id": s["s"], "lat": s["la"], "lon": s["lo"], "tags": self.stop_tags(st)})
+        tags = dict(rec["t"])
+        tags.update({"type": "route", "route": rec.get("mode", "bus"), "bus_routes:source": "routedb"})
+        rel = {"type": "relation", "id": rid, "members": members, "tags": tags}
+        times = rec.get("times")
+        if times and all("o" in s for s in stops):
+            starts = {}
+            for key, days in (("wd", "12345"), ("sa", "6"), ("su", "7")):
+                for d in days:
+                    starts[d] = [m * 60 for m in times.get(key, [])]
+            rel["gtfs"] = {"offs": [s["o"] for s in stops], "starts": starts}
+        extras = self._twins(road, stops, online)
+        return json.dumps({"elements": [rel] + elements + extras}, separators=(",", ":"), ensure_ascii=False)
+
+    def _twins(self, road, stops, online=True):
+        """The bus stops within DB_TWIN_M of the road that the line does not list: the platform of the other side of the road
+        (the mod picks the one on the right of the way of travel). Only for lines that span few tiles."""
+        if len(road) < 2:
+            return []
+        la, lo = [p[0] for p in road], [p[1] for p in road]
+        keys = self._tiles(min(la) - 0.001, min(lo) - 0.001, max(la) + 0.001, max(lo) + 0.001, online)
+        if not keys or len(keys) > DB_TWIN_TILES:
+            return []
+        listed = {s["s"] for s in stops}
+        path = simplify(road, 3)
+        out = []
+        for key in keys:
+            t = self.tile(key, online)
+            for st in (t or {}).get("stops", ()):
+                if st["id"] in listed or st.get("k") == "s" or not st.get("n"):
+                    continue
+                if not (min(la) - 0.001 <= st["lat"] <= max(la) + 0.001 and min(lo) - 0.001 <= st["lon"] <= max(lo) + 0.001):
+                    continue
+                if dist_to_path(st["lat"], st["lon"], path) <= DB_TWIN_M:
+                    out.append({"type": "node", "id": st["id"], "lat": st["lat"], "lon": st["lon"], "tags": self.stop_tags(st)})
+        return out
+
+    def status(self):
+        out = []
+        for repo in self.repos:
+            m = repo.manifest(online=False)
+            out.append({"repo": repo.mirrors[0] if repo.mirrors else "", "ready": bool(m),
+                        "countries": {cc: {k: e.get(k) for k in ("routes", "stops", "built", "sources")}
+                                      for cc, e in (m or {}).get("countries", {}).items()}})
+        return out
+
+
+def db_repos_from_env(cache_dir, env=None):
+    """BNE_BUSDATA_DB: '0' off; else ';'-separated repos, each a folder or a URL (several mirrors of one repo: ',' between)."""
+    env = os.environ if env is None else env
+    raw = env.get("BNE_BUSDATA_DB")
+    if raw == "0":
+        return []
+    specs = [[m.strip() for m in part.split(",") if m.strip()] for part in raw.split(";")] if raw else DB_REPOS
+    return [DbRepo(m, cache_dir) for m in specs if m]
+
+
 # ---- the public servers ---------------------------------------------------------------------------------------------
 
 def post_overpass(url, query):
@@ -1957,8 +2345,11 @@ def _fetch_osrm(pts, bases, getter, sleep, token):
 
 
 class Service:
-    def __init__(self, cache, upstream=fetch_upstream, ttl=TTL_S, router=fetch_osrm, geocoder=geo_search, places=None, gtfs=None):
+    def __init__(self, cache, upstream=fetch_upstream, ttl=TTL_S, router=fetch_osrm, geocoder=geo_search, places=None, gtfs=None,
+                 db=None, live=False):
         self.cache, self.upstream, self.ttl, self.router, self.geocoder = cache, upstream, ttl, router, geocoder
+        self.db = db or RouteDb([])
+        self.live = live                     # True: ignore the route database (fresh data from the map servers and timetables)
         self.places = places or Gazetteer(None)
         self.gtfs = gtfs or Gtfs(None)
         self.places.after = self.want_timetables
@@ -2055,7 +2446,13 @@ class Service:
     def nearby(self, lat, lon, offline=False):
         """(text, cached): the stops and lines around a point: OpenStreetMap's (kept per cell) with the timetables' lines
         merged in; the timetables alone while no map server answers. `offline`: only what this computer has (a background
-        load of the mod: never a public server); None when it has nothing."""
+        load of the mod: never a public server); None when it has nothing.
+        Where the route database has the place it answers (lines and stops prepared in advance, the real timetables' times
+        in them): nothing is asked of the map servers and no timetables are downloaded."""
+        if self.db.enabled and not self.live:
+            text = self.db.nearby(snap(lat), snap(lon), RADIUS_M, online=True)
+            if text is not None:
+                return text, True
         if not offline:
             self.want_timetables(lat, lon)
         found = self.gtfs.lines_near(snap(lat), snap(lon), RADIUS_M) if self.gtfs.ready() else None
@@ -2148,20 +2545,13 @@ class Service:
         except (ValueError, KeyError, TypeError, StopIteration):
             return text
 
-    def gtfs_route(self, rid, offline=False):
-        """`offline`: the road only from roads already kept (else straight lines between the stops), never a request.
-        The text of a route answer for a line of the timetables: a relation with one way (the road through its stops, asked
-        of the routing servers in windows of 24 stops) and its stops with their times from the start, as the mod reads
-        an OpenStreetMap route."""
-        pat = self.gtfs.pattern(rid)
-        if pat is None:
-            raise RuntimeError("no such line in the timetables")
-        stops = pat["stops"]
-        road, window = [], 24
-        i = 0
+    def road_through(self, points, offline=False):
+        """The road through stops, [(lat, lon), ...]: the routing servers' (asked in windows of 24 stops, each kept), or when
+        `offline` only roads already kept; straight lines where there is none."""
+        stops = [(round(a, 6), round(b, 6)) for a, b in points]
+        road, window, i = [], 24, 0
         while i < len(stops) - 1:
-            chunk = stops[i:i + window]
-            pts = [(round(x["lat"], 6), round(x["lon"], 6)) for x in chunk]
+            pts = stops[i:i + window]
             if len(pts) >= 2 and all(hav(a, b) <= MAX_LEG_M for a, b in zip(pts, pts[1:])):
                 if offline:
                     kept, _ = self.cache.get(path_key(pts))
@@ -2173,6 +2563,23 @@ class Service:
                 seg = pts
             road += seg if not road else seg[1:]
             i += window - 1
+        return road
+
+    def db_route(self, rid, offline=False):
+        """The route answer of a line of the route database (None when it is not there), with the towns round its road."""
+        text = self.db.route(rid, road_for=lambda pts: self.road_through(pts, offline), online=not offline)
+        return self.with_limits(text) if text is not None else None
+
+    def gtfs_route(self, rid, offline=False):
+        """`offline`: the road only from roads already kept (else straight lines between the stops), never a request.
+        The text of a route answer for a line of the timetables: a relation with one way (the road through its stops, asked
+        of the routing servers in windows of 24 stops) and its stops with their times from the start, as the mod reads
+        an OpenStreetMap route."""
+        pat = self.gtfs.pattern(rid)
+        if pat is None:
+            raise RuntimeError("no such line in the timetables")
+        stops = pat["stops"]
+        road = self.road_through([(x["lat"], x["lon"]) for x in stops], offline)
         way = {"type": "way", "ref": GTFS_ROUTE + rid % GTFS_ROUTE, "role": "",
                "geometry": [{"lat": a, "lon": b} for a, b in road]}
         members = [way] + [{"type": "node", "ref": GTFS_NODE + x["rowid"], "role": "platform", "lat": x["lat"], "lon": x["lon"]}
@@ -2497,6 +2904,9 @@ def make_handler(service, port):
             try:
                 if u.path == "/v1/info":
                     return self.send_json(200, json.dumps({"ok": True, "api": 1, "app": APP, "version": VERSION, "features": FEATURES}))
+                if u.path == "/v1/db":
+                    return self.send_json(200, json.dumps({"ok": True, "data": {"enabled": service.db.enabled, "live": service.live,
+                                                                               "repos": service.db.status()}}))
                 if u.path == "/v1/gtfs":
                     if q.get("lat") and q.get("lon"):
                         service.want_timetables(float(q["lat"][0]), float(q["lon"][0]))
@@ -2555,6 +2965,12 @@ def make_handler(service, port):
                 elif u.path == "/v1/route":
                     rid = int(q["id"][0])
                     offline = q.get("cached", ["0"])[0] == "1"     # a background load: this computer only, at once
+                    if service.db.enabled and not service.live and (rid >= DB_ROUTE_MIN or rid < GTFS_ROUTE):
+                        text = service.db_route(rid, offline)
+                        if text is not None:
+                            return self.send_json(200, b'{"ok":true,"cached":true,"data":' + text.encode("utf-8") + b"}")
+                        if rid >= DB_ROUTE_MIN:
+                            return self.fail(404, "no such line in the route database")
                     if GTFS_ROUTE <= rid < GTFS_NODE:
                         text, cached = service.gtfs_route(rid, offline=offline), False
                         return self.send_json(200, b'{"ok":true,"cached":false,"data":' + text.encode("utf-8") + b"}")
@@ -2646,7 +3062,8 @@ def serve(port=PORT, cache_dir=None, service=None):
         cache = Cache(cache_dir or default_cache_dir())
         base = pathlib.Path(cache.dir).parent
         no_gtfs = os.environ.get("BNE_BUSDATA_GTFS") == "0"
-        service = Service(cache, places=Gazetteer(base / "places"), gtfs=Gtfs(None if no_gtfs else base / "timetables"))
+        service = Service(cache, places=Gazetteer(base / "places"), gtfs=Gtfs(None if no_gtfs else base / "timetables"),
+                          db=RouteDb(db_repos_from_env(base)), live=os.environ.get("BNE_BUSDATA_LIVE") == "1")
     httpd = QuietServer(("127.0.0.1", port), make_handler(service, port))
     httpd.daemon_threads = True
     say(f"{APP} {VERSION} listening on 127.0.0.1:{port}, cache {service.cache.dir}")

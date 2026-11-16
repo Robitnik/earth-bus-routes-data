@@ -17,8 +17,15 @@ Next to its cache (`%LOCALAPPDATA%\earth-bus-routes` on Windows):
   `data.jr.ggu.cz`), about **124 MB** downloaded once and refreshed weekly, kept as a 65 MB index (the archive is deleted).
   It gives every bus line with its real departures. Only downloaded when you play in Czechia. To turn it off, start the
   service with the environment variable `BNE_BUSDATA_GTFS=0`.
+- **The route database** (0.11): lines and stops prepared in advance for Europe, Ukraine and the United States, from
+  `github.com/Robitnik/earth-bus-routes-db-eu` (raw.githubusercontent.com, with jsDelivr as a mirror). Only the small tile files of
+  the places you play in (a few KB to a few hundred KB each) and the lines you open are downloaded and kept; nothing is fetched
+  while the menu is closed. Where the database has the place, Overpass is not asked at all. To turn it off start the service with
+  `BNE_BUSDATA_DB=0`; `BNE_BUSDATA_DB=<folder>` reads a copy on this computer (hand-edited lines), `BNE_BUSDATA_LIVE=1` asks the
+  live servers first (the old way).
 - **Answers of OpenStreetMap** (Overpass), the routing server (OSRM) and the geocoder (Photon), kept for a week.
 
-Map data (c) OpenStreetMap contributors, ODbL. Towns (c) GeoNames, CC BY 4.0. Timetables: CIS JŘ (Ministry of Transport of the
+Map data (c) OpenStreetMap contributors, ODbL (the route database is a derivative database, ODbL; its timetable feeds and their
+licences are listed in its `sources/FEEDS.md`). Towns (c) GeoNames, CC BY 4.0. Timetables: CIS JŘ (Ministry of Transport of the
 Czech Republic, no conditions); stop positions (c) OpenStreetMap contributors and open data of Czech towns and regions (CC BY /
 CC BY-SA / CC0), see data.jr.ggu.cz. MIT licence. Source of truth: `companion/` in the main repository.
