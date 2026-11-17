@@ -46,27 +46,34 @@ Run it from BeamNG.Earth's Add-ons page (a "companion"), or by hand: python bus_
 Map data (c) OpenStreetMap contributors, ODbL. Towns (c) GeoNames, CC BY 4.0. Standard library only. MIT licence.
 """
 import argparse
+import array
+import concurrent.futures
 import hashlib
 import io
 import math
 import json
 import os
 import pathlib
+import platform
 import datetime
 import re
 import select
+import shutil
 import socket
+import subprocess
 import sys
+import tarfile
 import threading
 import unicodedata
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import wave
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 APP = "earth-bus-routes-data"
 PORT = 47630
 UA = f"{APP}/{VERSION} (+https://github.com/Robitnik/earth-bus-routes)"   # Overpass refuses clients without one
@@ -1096,9 +1103,26 @@ def road_limits(places, road):
     lats, lons = [p[0] for p in samples], [p[1] for p in samples]
     margin = 0.06                                         # degrees: a bit over the biggest radius
     box = (min(lats) - margin, min(lons) - margin, max(lats) + margin, max(lons) + margin)
+    # the road's points on a grid of cells as big as the biggest town radius: a town looks only at the 3 x 3 cells round it
+    # (a city line: 12 000 places x 2 600 points were 32 million distances, 7 s for each opening of a Berlin line)
+    kx = math.cos(math.radians(samples[0][0])) * 111320
+    cell = float(TOWN_RADIUS_MAX_M)
+    grid = {}
+    for la, lo in samples:
+        grid.setdefault((int(la * 110574 // cell), int(lo * kx // cell)), []).append((la, lo))
+    probe = samples[::max(1, len(samples) // 16)] + samples[-1:]      # (the country: the nearest town also when it is farther)
     towns, nearest = [], None
     for p in places(box):
-        best = min(_dist_m(p[2], p[3], la, lo) for la, lo in samples)
+        cy, cx = int(p[2] * 110574 // cell), int(p[3] * kx // cell)
+        best = float("inf")
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                for la, lo in grid.get((cy + dy, cx + dx), ()):
+                    d = _dist_m(p[2], p[3], la, lo)
+                    if d < best:
+                        best = d
+        if best > cell:
+            best = min(_dist_m(p[2], p[3], la, lo) for la, lo in probe)
         if nearest is None or best < nearest[0]:
             nearest = (best, p[6])
         if best <= town_radius(p[5]):
@@ -1859,7 +1883,14 @@ DB_MAX_BYTES = 8 * 1024 * 1024
 DB_MANIFEST_TTL_S = 86400                 # the database is rebuilt monthly: a day is plenty
 DB_MANIFEST_RETRY_S = 600                 # after a failure (offline, repo not there) it is left alone this long
 DB_FILE_TTL_S = 14 * 86400
-DB_TILES_IN_MEMORY = 48
+DB_TILES_IN_MEMORY = 400                  # (a tile is ~10 KB of JSON: a 25 km map of tiles fits)
+DB_FETCH_THREADS = 16                     # the tiles of a cold place are fetched this many at a time
+DB_LINES_M = (12000, 30000)               # a line number is looked for this far round the player (the second only when the first finds none)
+DB_STATIONS_M = 7000                      # the stations of a town: the menu shows those within 6 km of its centre
+DB_HUB_LINES = 3                          # ... and the stops with at least this many lines (a village has no bus station)
+DB_HUBS_MAX = 60
+DB_NAME_M = 15000                         # a stop name typed in the search: the tiles this near that are already on this computer
+DB_ALONG_CELL_DEG = 0.005                 # the grid that finds the bits of the road near a stop
 DB_TWIN_M = 30                            # a stop this near the road, not listed by the line, is on the road (the other side)
 DB_TWIN_TILES = 6                         # ... looked for when the line spans no more tiles than this
 DB_WAY_ID = 7 * 10 ** 12                  # ids of the made-up ways of an answer made from a database line (only used as keys)
@@ -2077,6 +2108,154 @@ class RouteDb:
                 self._where[r["id"]] = (i, cc)
         return t
 
+    def load(self, keys, online=True):
+        """{key: tile} of the tiles of `keys` that exist; the ones not in memory are read at once in parallel (a cold place: one
+        round trip to the net, not one per tile)."""
+        out, todo = {}, []
+        with self._lock:
+            for k in keys:
+                t = self._mem.get(k)
+                if t is None:
+                    todo.append(k)
+                else:
+                    out[k] = t
+        if len(todo) == 1:
+            t = self.tile(todo[0], online)
+            if t is not None:
+                out[todo[0]] = t
+        elif todo:
+            with concurrent.futures.ThreadPoolExecutor(min(DB_FETCH_THREADS, len(todo))) as ex:
+                for k, t in zip(todo, ex.map(lambda k: self.tile(k, online), todo)):
+                    if t is not None:
+                        out[k] = t
+        return out
+
+    @staticmethod
+    def box(lat, lon, radius):
+        """(lat0, lon0, lat1, lon1) of a square round a point."""
+        dlat = radius / 110574 + 0.0005
+        dlon = radius / (111320 * max(0.2, math.cos(math.radians(lat)))) + 0.0005
+        return lat - dlat, lon - dlon, lat + dlat, lon + dlon
+
+    def node(self, st):
+        return {"type": "node", "id": st["id"], "lat": st["lat"], "lon": st["lon"], "tags": self.stop_tags(st)}
+
+    def lines_numbered(self, ref, lat, lon, online=True):
+        """The text of the lines with this number round a point (the relations' tags: the search lists them, opening one asks for
+        its route), or None when the database does not know the place. Nearer first: a second, wider look only when the first
+        finds none."""
+        want = fold(str(ref))
+        found = {}
+        for radius in DB_LINES_M:
+            keys = self._tiles(*self.box(lat, lon, radius), online)
+            if not keys:
+                return None
+            for t in self.load(keys, online).values():
+                for r in t["routes"]:
+                    if r["id"] not in found and fold(str(r["t"].get("ref") or "")) == want:
+                        tags = dict(r["t"])
+                        tags["type"] = "route"
+                        tags.setdefault("route", "bus")
+                        found[r["id"]] = {"type": "relation", "id": r["id"], "tags": tags, "members": [], "n": r["n"]}
+            if found:
+                break
+        return json.dumps({"elements": [found[k] for k in sorted(found)], "source": "routedb"}, separators=(",", ":"),
+                          ensure_ascii=False)
+
+    def stations(self, lat, lon, radius=DB_STATIONS_M, online=True):
+        """The text of the bus stations round a point, and the stops most lines call at (a town without a bus station still
+        has a main stop), or None when the database does not know the place."""
+        keys = self._tiles(*self.box(lat, lon, radius), online)
+        if not keys:
+            return None
+        tiles = self.load(keys, online).values()
+        calls = {}
+        for t in tiles:
+            for r in t["routes"]:
+                for item in r["s"]:
+                    calls[item[0]] = calls.get(item[0], 0) + 1
+        stations, hubs = [], []
+        for t in tiles:
+            for st in t["stops"]:
+                if not st.get("n") or not _near(lat, lon, st["lat"], st["lon"], radius):
+                    continue
+                if st.get("k") == "s":
+                    stations.append(st)
+                elif calls.get(st["id"], 0) >= DB_HUB_LINES:
+                    hubs.append(st)
+        hubs.sort(key=lambda st: -calls[st["id"]])
+        elements = [self.node(st) for st in stations + hubs[:DB_HUBS_MAX]]
+        return json.dumps({"elements": elements, "source": "routedb"}, separators=(",", ":"), ensure_ascii=False)
+
+    def along(self, road, radius=ALONG_M, online=True):
+        """The text of the stops on a road [(lat, lon), ...] (within `radius` metres of it; a bus station within ALONG_STATION_M),
+        or None when the database does not know the places of the road."""
+        path = simplify([tuple(p) for p in road], 3)
+        if len(path) < 2:
+            return None
+        g, m = DB_ALONG_CELL_DEG, 0.0015                    # (the margin covers ALONG_STATION_M)
+        cells, keys = {}, set()
+        for i, ((la, lo), (lb, lob)) in enumerate(zip(path, path[1:])):
+            y0, y1 = min(la, lb) - m, max(la, lb) + m
+            x0, x1 = min(lo, lob) - m, max(lo, lob) + m
+            keys.update(self._tiles(y0, x0, y1, x1, online))
+            for y in range(int(math.floor(y0 / g)), int(math.floor(y1 / g)) + 1):
+                for x in range(int(math.floor(x0 / g)), int(math.floor(x1 / g)) + 1):
+                    cells.setdefault((y, x), []).append(i)
+        if not keys:
+            return None
+        out = []
+        for t in self.load(sorted(keys), online).values():
+            for st in t["stops"]:
+                segs = cells.get((int(math.floor(st["lat"] / g)), int(math.floor(st["lon"] / g))))
+                if not segs:
+                    continue
+                limit = ALONG_STATION_M if st.get("k") == "s" else radius
+                if min(dist_to_path(st["lat"], st["lon"], path[i:i + 2]) for i in segs) <= limit:
+                    out.append(self.node(st))
+        return json.dumps({"elements": out, "source": "routedb"}, separators=(",", ":"), ensure_ascii=False)
+
+    def map_places(self, lat, lon, radius, online=True):
+        """[[name, lat, lon, {line numbers}, kind]] of the bus stations and of the stops lines call at round a point, for the
+        map; None when the database does not know the place."""
+        keys = self._tiles(*self.box(lat, lon, radius), online)
+        if not keys:
+            return None
+        tiles = self.load(keys, online).values()
+        refs = {}
+        for t in tiles:
+            for r in t["routes"]:
+                ref = str(r["t"].get("ref") or "")
+                if ref:
+                    for item in r["s"]:
+                        refs.setdefault(item[0], set()).add(ref)
+        out = []
+        for t in tiles:
+            for st in t["stops"]:
+                if not st.get("n") or not _near(lat, lon, st["lat"], st["lon"], radius):
+                    continue
+                kind = "station" if st.get("k") == "s" else "stop"
+                r = refs.get(st["id"])
+                if kind == "stop" and not r:
+                    continue                                # a stop no line of the database calls at
+                out.append([st["n"], st["lat"], st["lon"], set(r or ()), kind])
+        return out
+
+    def named(self, text, lat, lon, radius=DB_NAME_M, limit=40):
+        """Stops whose name has `text` in it, round a point, from the tiles already on this computer (no request: the search
+        answers in milliseconds), nearest first."""
+        want = fold(text).strip()
+        if len(want) < 2:
+            return []
+        keys = self._tiles(*self.box(lat, lon, radius), online=False)
+        hits = {}
+        for t in self.load(keys, online=False).values():
+            for st in t["stops"]:
+                if st.get("n") and want in fold(st["n"]) and _near(lat, lon, st["lat"], st["lon"], radius):
+                    hits[st["id"]] = st
+        best = sorted(hits.values(), key=lambda st: _dist_m(lat, lon, st["lat"], st["lon"]))[:limit]
+        return [self.node(st) for st in best]
+
     @staticmethod
     def stop_tags(st):
         tags = {"name": st["n"]} if st.get("n") else {}
@@ -2105,8 +2284,9 @@ class RouteDb:
             return None
         self.last = (lat, lon)
         nodes, rels = {}, {}
+        tiles = self.load(keys, online)
         for key in keys:
-            t = self.tile(key, online)
+            t = tiles.get(key)
             if t is None:
                 return None
             for st in t["stops"]:
@@ -2356,11 +2536,21 @@ def fetch_osrm(pts, bases=None, getter=None, sleep=time.sleep):
         ACTIVITY.end(token)
 
 
+ROUTERS_DOWN_S = 120                 # after none of the routing servers could be reached: no new try for this long (straight lines meanwhile)
+_routers = {"down_until": 0.0}
+
+
 def _fetch_osrm(pts, bases, getter, sleep, token):
+    live = getter is None                # (the real network: a test with its own getter is left alone)
     getter = getter or get_url
+    if live and time.monotonic() < _routers["down_until"]:
+        raise RuntimeError("the routing servers could not be reached a moment ago")
     errors = []
+    unreachable = 0
     start = time.monotonic()
     for n, base in enumerate((bases or OSRM) * 2):
+        if live and n >= len(bases or OSRM) and unreachable >= len(bases or OSRM):
+            break                        # every server was tried and none could be connected to: a second round only waits longer
         if n and not still_wanted():
             raise Abandoned("nobody waits for it any more")
         if time.monotonic() - start > BUDGET_S:
@@ -2378,7 +2568,12 @@ def _fetch_osrm(pts, bases, getter, sleep, token):
             errors.append(f"{host}: {type(e).__name__} {str(e)[:60]}")
             if isinstance(e, ValueError) and "no route" in str(e):
                 break
+            if not isinstance(e, ValueError):
+                unreachable += 1
         sleep(BACKOFF_S[min(n, len(BACKOFF_S) - 1)] / 2)
+    if live and unreachable >= len(bases or OSRM):
+        _routers["down_until"] = time.monotonic() + ROUTERS_DOWN_S
+        say(f"no routing server could be reached: straight lines for {ROUTERS_DOWN_S} s")
     raise RuntimeError("; ".join(errors[-3:]) or "no routing server")
 
 
@@ -2406,10 +2601,473 @@ def polyline_encode(points):
     return "".join(out)
 
 
+# ---- the stop announcer (informator): offline voices ---------------------------------------------------------------------
+# The mod asks for one sentence at a time ("Next stop: X") in the language of the country the bus drives in; Piper (MIT, the
+# 2023.11.14-2 engine) reads it on this computer with a voice of rhasspy/piper-voices (each voice has its own licence, see its
+# MODEL_CARD). The engine (22 MB) and one voice per language (60-110 MB) are downloaded once, when a trip first wants them, and
+# only while the mod keeps asking: a trip that ends stops the download. Nothing runs between trips (an idle engine is closed).
+
+PIPER_REL = "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/"
+PIPER_ASSETS = {("win32", "amd64"): "piper_windows_amd64.zip", ("linux", "x86_64"): "piper_linux_x86_64.tar.gz",
+                ("linux", "aarch64"): "piper_linux_aarch64.tar.gz", ("darwin", "arm64"): "piper_macos_aarch64.tar.gz",
+                ("darwin", "x86_64"): "piper_macos_x64.tar.gz"}
+PIPER_MAX_BYTES = 40 * 1048576
+VOICE_MAX_BYTES = 160 * 1048576
+VOICE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/{rev}/{path}"
+VOICE_OLD = "v1.0.0"                                       # the voices as the 2023 engine reads them
+VOICE_NEW = "4a409e3cbfd0a189930b38f127a38e107677e8ac"     # 2026-11-15: voices that exist only in the newer form (pinned: the
+                                                           # voices are retrained in place, a moving "main" would change them)
+# the language of the announcements -> (voice, revision, speaker or None). A language without a voice of its own the 2023 engine
+# can read takes the nearest one (lt: Latvian, hr: Slovenian); bg and et have only new voices (their diphthong symbols are dropped).
+VOICES = {
+    "uk": ("uk_UA-ukrainian_tts-medium", VOICE_OLD, 2),     # speakers: lada 0, mykyta 1, tetiana 2
+    "cs": ("cs_CZ-jirka-medium", VOICE_OLD, None),
+    "sk": ("sk_SK-lili-medium", VOICE_OLD, None),
+    "pl": ("pl_PL-gosia-medium", VOICE_OLD, None),
+    "de": ("de_DE-thorsten-medium", VOICE_OLD, None),
+    "de_AT": ("de_DE-thorsten-medium", VOICE_OLD, None),
+    "hu": ("hu_HU-anna-medium", VOICE_OLD, None),
+    "ro": ("ro_RO-mihai-medium", VOICE_OLD, None),
+    "fr": ("fr_FR-siwis-medium", VOICE_OLD, None),
+    "nl": ("nl_NL-pim-medium", VOICE_OLD, None),
+    "nl_BE": ("nl_BE-nathalie-medium", VOICE_OLD, None),
+    "it": ("it_IT-paola-medium", VOICE_OLD, None),
+    "es": ("es_ES-davefx-medium", VOICE_OLD, None),
+    "pt": ("pt_PT-tugão-medium", VOICE_OLD, None),
+    "sv": ("sv_SE-lisa-medium", VOICE_OLD, None),
+    "da": ("da_DK-talesyntese-medium", VOICE_OLD, None),
+    "no": ("no_NO-talesyntese-medium", VOICE_OLD, None),
+    "fi": ("fi_FI-harri-medium", VOICE_OLD, None),
+    "et": ("et_EE-news-medium", VOICE_NEW, 0),
+    "lv": ("lv_LV-aivars-medium", VOICE_OLD, None),
+    "lt": ("lv_LV-aivars-medium", VOICE_OLD, None),
+    "sl": ("sl_SI-artur-medium", VOICE_OLD, None),
+    "hr": ("sl_SI-artur-medium", VOICE_OLD, None),
+    "bg": ("bg_BG-dimitar-medium", VOICE_NEW, None),
+    "el": ("el_GR-joy-medium", VOICE_NEW, None),
+    "en_GB": ("en_GB-alba-medium", VOICE_OLD, None),
+    "en_US": ("en_US-lessac-medium", VOICE_OLD, None),
+}
+COUNTRY_LANG = {
+    "UA": "uk", "CZ": "cs", "SK": "sk", "PL": "pl", "DE": "de", "AT": "de_AT", "CH": "de", "LI": "de", "HU": "hu", "RO": "ro",
+    "MD": "ro", "FR": "fr", "MC": "fr", "LU": "fr", "NL": "nl", "IT": "it", "SM": "it", "VA": "it", "ES": "es", "AD": "es",
+    "PT": "pt", "SE": "sv", "DK": "da", "NO": "no", "FI": "fi", "EE": "et", "LV": "lv", "LT": "lt", "SI": "sl", "HR": "hr",
+    "BG": "bg", "GR": "el", "CY": "el", "IE": "en_GB", "MT": "en_GB", "GB": "en_GB", "US": "en_US",
+}
+# What the bus says, the way the country's own buses say it (docs/research/stop-announcements.md): "at" when it nears a stop,
+# "end" when it nears the terminus, "next" once the doors close, "nextEnd" when that next stop is the terminus; "...Req" for a
+# request stop where the country says so. {s} is the stop's name.
+PHRASES = {
+    "uk": {"at": "Зупинка {s}.", "atReq": "Зупинка {s}, на вимогу.", "end": "Кінцева зупинка {s}. Прохання звільнити салон.",
+           "next": "Наступна зупинка: {s}.", "nextReq": "Наступна зупинка: {s}, на вимогу.", "nextEnd": "Наступна зупинка: {s}, кінцева."},
+    "cs": {"at": "{s}.", "atReq": "{s}, na znamení.", "end": "{s}. Konečná zastávka, prosíme, vystupte.",
+           "next": "Příští zastávka: {s}.", "nextReq": "Příští zastávka: {s}, na znamení.", "nextEnd": "Příští zastávka: {s}, konečná."},
+    "sk": {"at": "{s}.", "atReq": "{s}, na znamenie.", "end": "{s}. Konečná zastávka, prosíme, vystúpte.",
+           "next": "Nasledujúca zastávka: {s}.", "nextReq": "Nasledujúca zastávka: {s}, na znamenie.",
+           "nextEnd": "Nasledujúca zastávka: {s}, konečná."},
+    "pl": {"at": "Przystanek {s}.", "atReq": "Przystanek na żądanie {s}.", "end": "Przystanek końcowy {s}. Prosimy o opuszczenie pojazdu.",
+           "next": "Następny przystanek: {s}.", "nextReq": "Następny przystanek: {s}, na żądanie.",
+           "nextEnd": "Następny przystanek: {s}. Przystanek końcowy."},
+    "de": {"at": "{s}.", "end": "{s}. Endhaltestelle. Bitte alle aussteigen.", "next": "Nächster Halt: {s}.",
+           "nextEnd": "Nächster Halt: {s}. Endhaltestelle."},
+    "de_AT": {"at": "{s}.", "end": "{s}. Endstation. Bitte alle aussteigen.", "next": "Nächste Haltestelle: {s}.",
+              "nextEnd": "Nächste Haltestelle: {s}. Endstation."},
+    "hu": {"at": "{s}.", "atReq": "{s}, feltételes megálló.", "end": "{s}, végállomás. Kérjük, szálljanak le!",
+           "next": "Következik: {s}.", "nextReq": "Következik: {s}, feltételes megálló.", "nextEnd": "Következik: {s}, végállomás."},
+    "ro": {"at": "Stația {s}.", "atReq": "Stația {s}, stație facultativă.", "end": "Stația {s}. Capăt de linie. Vă rugăm să coborâți.",
+           "next": "Următoarea stație: {s}.", "nextReq": "Următoarea stație: {s}, stație facultativă.",
+           "nextEnd": "Următoarea stație: {s}, capăt de linie."},
+    "fr": {"at": "{s}.", "end": "{s}. Terminus. Tout le monde descend.", "next": "Prochain arrêt : {s}.",
+           "nextEnd": "Prochain arrêt : {s}. Terminus."},
+    "nl": {"at": "{s}.", "end": "{s}. Eindhalte. Iedereen uitstappen, alstublieft.", "next": "Volgende halte: {s}.",
+           "nextEnd": "Volgende halte: {s}. Eindhalte."},
+    "nl_BE": {"at": "{s}.", "end": "{s}. Eindhalte. Iedereen uitstappen, alstublieft.", "next": "Volgende halte: {s}.",
+              "nextEnd": "Volgende halte: {s}. Eindhalte."},
+    "it": {"at": "{s}.", "atReq": "{s}, fermata a richiesta.", "end": "{s}. Capolinea.", "next": "Prossima fermata: {s}.",
+           "nextReq": "Prossima fermata: {s}, fermata a richiesta.", "nextEnd": "Prossima fermata: {s}. Capolinea."},
+    "es": {"at": "{s}.", "end": "{s}. Final de trayecto.", "next": "Próxima parada: {s}.", "nextEnd": "Próxima parada: {s}. Final de trayecto."},
+    "pt": {"at": "{s}.", "end": "{s}. Fim de linha.", "next": "Próxima paragem: {s}.", "nextEnd": "Próxima paragem: {s}. Fim de linha."},
+    "sv": {"at": "{s}.", "end": "{s}. Slutstation.", "next": "Nästa hållplats: {s}.", "nextEnd": "Nästa hållplats: {s}. Slutstation."},
+    "da": {"at": "{s}.", "end": "{s}. Endestation.", "next": "Næste stop: {s}.", "nextEnd": "Næste stop: {s}. Endestation."},
+    "no": {"at": "{s}.", "end": "{s}. Endeholdeplass.", "next": "Neste holdeplass: {s}.", "nextEnd": "Neste holdeplass: {s}. Endeholdeplass."},
+    "fi": {"at": "{s}.", "end": "{s}. Päätepysäkki.", "next": "Seuraava pysäkki: {s}.", "nextEnd": "Seuraava pysäkki: {s}. Päätepysäkki."},
+    "et": {"at": "{s}.", "end": "{s}. Lõpp-peatus.", "next": "Järgmine peatus: {s}.", "nextEnd": "Järgmine peatus: {s}. Lõpp-peatus."},
+    "lv": {"at": "{s}.", "end": "{s}. Galapunkts.", "next": "Nākamā pietura: {s}.", "nextEnd": "Nākamā pietura: {s}. Galapunkts."},
+    "lt": {"at": "{s}.", "end": "{s}. Galinė stotelė.", "next": "Kita stotelė: {s}.", "nextEnd": "Kita stotelė: {s}. Galinė stotelė."},
+    "sl": {"at": "{s}.", "end": "{s}. Končna postaja.", "next": "Naslednja postaja: {s}.", "nextEnd": "Naslednja postaja: {s}. Končna postaja."},
+    "hr": {"at": "{s}.", "end": "{s}. Posljednje stajalište.", "next": "Sljedeće stajalište: {s}.",
+           "nextEnd": "Sljedeće stajalište: {s}. Posljednje stajalište."},
+    "bg": {"at": "Спирка {s}.", "end": "{s}. Последна спирка.", "next": "Следваща спирка: {s}.", "nextEnd": "Следваща спирка: {s}. Последна спирка."},
+    "el": {"at": "{s}.", "end": "{s}. Τέλος διαδρομής.", "next": "Επόμενη στάση: {s}.", "nextEnd": "Επόμενη στάση: {s}. Τέλος διαδρομής."},
+    "en_GB": {"at": "{s}.", "end": "{s}. This is the last stop. All change, please.", "next": "Next stop: {s}.",
+              "nextEnd": "Next stop: {s}. This bus terminates there."},
+    "en_US": {"at": "{s}.", "end": "{s}. This is the last stop.", "next": "Next stop: {s}.", "nextEnd": "Next stop: {s}, the last stop."},
+}
+SAY_KINDS = ("at", "end", "next", "nextEnd")
+SAY_MAX_CHARS = 300
+# the short forms of stop names, read out in full (a voice reads "nám." as "nam"): [(pattern, replacement)] per language
+_UP = "A-ZÁÄČĎÉĚÍĹĽŇÓÔŔŘŠŤÚŮÝŽ"
+EXPAND = {
+    "uk": [(r"\bвул\.\s*", "вулиця "), (r"\bпл\.\s*", "площа "), (r"\b(?:просп|пр-т|пр)\.\s*", "проспект "),
+           (r"\b(?:бульв|б-р)\.\s*", "бульвар "), (r"\bпров\.\s*", "провулок "), (r"\bм-н\b\.?\s*", "мікрорайон "),
+           (r"\bАС\b", "автостанція"), (r"\bзал\.\s*вокз\.?", "залізничний вокзал"), (r"\bс\.\s+", "село "), (r"\bсмт\.?\s+", "селище ")],
+    "cs": [(r"\bnám\.\s*", "náměstí "), (r"\baut\.\s*st\.?|\bAS\b", "autobusové stanoviště"), (r"\bžel\.\s*st\.?", "železniční stanice"),
+           (r"\bžel\.\s*zast\.?", "železniční zastávka"), (r"\bhl\.\s*n\.?", "hlavní nádraží"), (r"\brozc\.\s*", "rozcestí "),
+           (r"\bsídl\.\s*", "sídliště "), (r"\bnem\.\s*", "nemocnice "), (r"\bkřiž\.\s*", "křižovatka "), (r"\bZŠ\b", "základní škola"),
+           (r"\bMŠ\b", "mateřská škola"), (r"\b(?:OÚ|ObÚ)\b", "obecní úřad"), (r"\bMěÚ\b", "městský úřad"), (r"\bhost\.\s*", "hostinec "),
+           (rf"\bn\.\s*(?=[{_UP}])", "nad "), (rf"\bp\.\s*(?=[{_UP}])", "pod "), (r"\bMet\.", "Metují"), (r"\bOrl\.", "Orlicí"),
+           (r"\bLab\.", "Labem")],
+    "sk": [(r"\bnám\.\s*", "námestie "), (r"\baut\.\s*st\.?|\bAS\b", "autobusová stanica"), (r"\bžel\.\s*st\.?", "železničná stanica"),
+           (r"\brázc\.\s*", "rázcestie "), (r"\bsídl\.\s*", "sídlisko "), (r"\bZŠ\b", "základná škola"), (r"\bOÚ\b", "obecný úrad"),
+           (rf"\bn\.\s*(?=[{_UP}])", "nad "), (rf"\bp\.\s*(?=[{_UP}])", "pod ")],
+    "pl": [(r"\bul\.\s*", ""), (r"\bpl\.\s*", "plac "), (r"\bal\.\s*", "aleja "), (r"\bos\.\s*", "osiedle "), (r"\b[Dd]w\.\s*", "Dworzec "),
+           (r"\s*\bn/ż\b", "")],
+    "de": [(r"(\w)str\.", r"\1straße"), (r"\bStr\.", "Straße"), (r"\bPl\.", "Platz"), (r"\bHbf\b\.?", "Hauptbahnhof"),
+           (r"\bBf\b\.?", "Bahnhof"), (r"\bS\+U\b", "S- und U-Bahnhof"), (r"\bAbzw\.\s*", "Abzweig "), (r"\bRi\.\s*", "Richtung ")],
+    "de_AT": [(r"(\w)str\.", r"\1straße"), (r"\bStr\.", "Straße"), (r"\bPl\.", "Platz"), (r"\bHbf\b\.?", "Hauptbahnhof"), (r"\bBf\b\.?", "Bahnhof")],
+    "hu": [(r"\bu\.", "utca"), (r"\bkrt\.", "körút"), (r"\bvá\.", "vasútállomás"), (r"\bpu\.", "pályaudvar"), (r"\baut\.\s*áll\.", "autóbusz-állomás")],
+    "ro": [(r"\bStr\.\s*", "Strada "), (r"\b(?:Bd|B-dul)\.?\s*", "Bulevardul "), (r"\bP-ța\s*|\bPța\.\s*", "Piața "), (r"\bCal\.\s*", "Calea ")],
+    "fr": [(r"\bPl\.\s*", "Place "), (r"\bAv\.\s*", "Avenue "), (r"\bBd\b\.?\s*", "Boulevard "), (r"\bSt[e]?-", lambda m: "Sainte-" if m.group(0) == "Ste-" else "Saint-")],
+    "it": [(r"\bP\.?\s?zz?a\b\.?\s*", "Piazza "), (r"\bV\.le\s*", "Viale "), (r"\bC\.so\s*", "Corso "), (r"\bV\.\s*", "Via "), (r"\bStaz\.\s*", "Stazione ")],
+    "es": [(r"\bAv(?:da)?\.\s*", "Avenida "), (r"\bC/\s*", "Calle "), (r"\bPza?\.\s*", "Plaza "), (r"\bEst\.\s*", "Estación ")],
+    "pt": [(r"\bAv\.\s*", "Avenida "), (r"\bR\.\s*", "Rua "), (r"\bPç\.\s*", "Praça "), (r"\bEst\.\s*", "Estação ")],
+}
+
+
+def speakable(name, lang):
+    """A stop's name as a voice should read it: short forms in full, no quotes or brackets, separators as pauses."""
+    s = str(name or "").strip()
+    for pat, rep in EXPAND.get(lang, ()):
+        s = re.sub(pat, rep, s)
+    s = re.sub(r"[\"«»„“”]", "", s)
+    s = re.sub(r"\s*[()\[\]]\s*", ", ", s)
+    s = re.sub(r"\s*(?:/|;|\s[-–—]\s|\|)\s*", ", ", s)
+    s = re.sub(r"\s*,\s*", ", ", s)
+    s = re.sub(r"(?:,\s*)+", ", ", s)
+    s = re.sub(r"\s{2,}", " ", s).strip(" ,.")
+    return s
+
+
+def announce_lang(cc, lat=None, lon=None, fallback=None):
+    """The language of the announcements in a country (Belgium: Dutch in Flanders, French in Wallonia and Brussels); else the
+    game's language when there is a voice for it; else None."""
+    cc = (cc or "").upper()
+    if cc == "BE":
+        if lat is None or lon is None:
+            return "fr"
+        brussels = 50.77 <= lat <= 50.92 and 4.24 <= lon <= 4.49
+        return "nl_BE" if lat >= 50.76 and not brussels else "fr"
+    if cc in COUNTRY_LANG:
+        return COUNTRY_LANG[cc]
+    f = (fallback or "").replace("-", "_")
+    if f in PHRASES:
+        return f
+    f = {"en": "en_US", "pt_BR": "pt", "pt_PT": "pt"}.get(f, f[:2])
+    return f if f in PHRASES else None
+
+
+def announcement(lang, kind, name, request=False):
+    """The sentence the bus says (kind: one of SAY_KINDS) in the language `lang` (a key of PHRASES)."""
+    p = PHRASES[lang]
+    key = kind + "Req" if request and kind + "Req" in p else kind
+    return p[key].format(s=speakable(name, lang))
+
+
+def chime(rate, seconds=1.0):
+    """The two-tone gong the announcements begin with (16-bit mono PCM at `rate`)."""
+    n = int(rate * seconds)
+    out = array.array("h", bytes(2 * n))
+    for f, start in ((659.25, 0.0), (523.25, 0.38)):
+        s0 = int(start * rate)
+        for i in range(n - s0):
+            t = i / rate
+            env = min(1.0, t / 0.006) * math.exp(-4.2 * t)
+            v = math.sin(2 * math.pi * f * t) + 0.35 * math.sin(4 * math.pi * f * t) + 0.12 * math.sin(6 * math.pi * f * t)
+            out[s0 + i] = max(-32767, min(32767, out[s0 + i] + int(9000 * env * v)))
+    return out.tobytes()
+
+
+def wav_bytes(rate, pcm):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def with_chime(speech_wav, gong=True):
+    """The finished clip: the gong, a breath, the speech, a short tail. Returns (wav bytes, seconds)."""
+    with wave.open(io.BytesIO(speech_wav), "rb") as w:
+        rate, width, ch = w.getframerate(), w.getsampwidth(), w.getnchannels()
+        pcm = w.readframes(w.getnframes())
+    if width != 2 or ch != 1:
+        raise ValueError("the voice gave no 16-bit mono sound")
+    head = (chime(rate) + bytes(2 * int(rate * 0.1))) if gong else b""
+    body = head + pcm + bytes(2 * int(rate * 0.25))
+    return wav_bytes(rate, body), round(len(body) / 2 / rate, 2)
+
+
+def voice_path(key):
+    """"uk_UA-ukrainian_tts-medium" -> "uk/uk_UA/ukrainian_tts/medium/uk_UA-ukrainian_tts-medium" (the folder of rhasspy/piper-voices)."""
+    code, rest = key.split("-", 1)
+    name, quality = rest.rsplit("-", 1)
+    return f"{code.split('_')[0]}/{code}/{name}/{quality}/{key}"
+
+
+def fit_config(cfg):
+    """A voice config the 2023 engine reads: the newer voices name symbols of two letters (diphthongs) it cannot load."""
+    ids = cfg.get("phoneme_id_map") or {}
+    multi = [k for k in ids if len(k) != 1]
+    if multi or "vowel_clusters" in cfg:
+        cfg = dict(cfg, phoneme_id_map={k: v for k, v in ids.items() if len(k) == 1})
+        cfg.pop("vowel_clusters", None)
+    return cfg
+
+
+class VoiceNotReady(RuntimeError):
+    pass
+
+
+class PiperProc:
+    """One running engine with one voice loaded: a sentence in (a JSON line), the path of its WAV out."""
+
+    def __init__(self, exe, model, clock=time.monotonic):
+        flags = 0x08000000 if sys.platform == "win32" else 0        # CREATE_NO_WINDOW: no console pops up over the game
+        self.p = subprocess.Popen([str(exe), "--model", str(model), "--json-input"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, cwd=str(pathlib.Path(exe).parent), creationflags=flags,
+                                  text=True, encoding="utf-8")
+        self.lock = threading.Lock()
+        self.clock = clock
+        self.used = clock()
+
+    def speak(self, text, out, speaker=None, timeout=30):
+        with self.lock:
+            self.used = self.clock()
+            msg = {"text": text, "output_file": str(out)}
+            if speaker is not None:
+                msg["speaker_id"] = speaker
+            killer = threading.Timer(timeout, self.close)
+            killer.start()
+            try:
+                self.p.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                self.p.stdin.flush()
+                line = self.p.stdout.readline().strip()
+            finally:
+                killer.cancel()
+            self.used = self.clock()
+            if not line:
+                raise RuntimeError("the voice engine stopped")
+            return pathlib.Path(line)
+
+    def alive(self):
+        return self.p.poll() is None
+
+    def close(self):
+        try:
+            self.p.kill()
+        except OSError:
+            pass
+
+
+class Announcer:
+    """The voices of this computer (folder voice/: engine/, models/, clips/). prepare(lang) gets what a language needs (in a thread
+    of its own, while the mod keeps asking: a lease of LEASE_S); speak(lang, text) gives the finished clip."""
+    LEASE_S = 90
+    IDLE_S = 120
+    CLIPS_MAX_BYTES = 200 * 1048576
+
+    def __init__(self, directory=None, fetch=download_file, clock=time.monotonic, engine=None):
+        self.dir = pathlib.Path(directory) if directory else None
+        self.fetch, self.clock = fetch, clock
+        self.engine = engine          # tests: engine(model_path, text, speaker) -> WAV bytes, instead of the Piper program
+        self._lock = threading.Lock()
+        self._jobs = {}               # voice -> {"state": "downloading" | "failed", "got", "total", "error"}
+        self._until = {}              # voice -> clock: somebody still wants it
+        self._procs = {}
+        self._reaper = None
+        self._writes = 0
+
+    # where things are
+    def _asset(self):
+        return PIPER_ASSETS.get((sys.platform, platform.machine().lower()))
+
+    def _exe(self):
+        return self.dir / "engine" / "piper" / ("piper.exe" if sys.platform == "win32" else "piper")
+
+    def _model(self, key):
+        return self.dir / "models" / (key + ".onnx")
+
+    def _ready(self, key):
+        if self.dir is None:
+            return False
+        m = self._model(key)
+        return m.exists() and m.with_suffix(".onnx.json").exists() and (self.engine is not None or self._exe().exists())
+
+    def status(self, lang):
+        if not lang or lang not in VOICES:
+            return {"lang": lang, "state": "none"}
+        key, _, _ = VOICES[lang]
+        out = {"lang": lang, "voice": key}
+        if self.dir is None or (self.engine is None and not self._asset()):
+            return dict(out, state="unsupported")
+        if self._ready(key):
+            return dict(out, state="ready")
+        with self._lock:
+            job = dict(self._jobs.get(key) or {"state": "missing"})
+        return dict(out, **job)
+
+    def prepare(self, lang):
+        """The status of a language's voice; a missing one starts downloading (a failed one is tried again after a minute)."""
+        st = self.status(lang)
+        if st["state"] in ("none", "unsupported", "ready"):
+            return st
+        key = st["voice"]
+        with self._lock:
+            self._until[key] = self.clock() + self.LEASE_S
+            job = self._jobs.get(key)
+            busy = job and (job["state"] == "downloading" or (job["state"] == "failed" and self.clock() - job["at"] < 60))
+            if not busy:
+                self._jobs[key] = {"state": "downloading", "got": 0, "total": 0, "at": self.clock()}
+        if not busy:
+            threading.Thread(target=self._download, args=(lang,), daemon=True).start()
+        return self.status(lang)
+
+    def _download(self, lang):
+        key, rev, _ = VOICES[lang]
+
+        def progress(done, total, base=0):
+            with self._lock:
+                job = self._jobs.get(key)
+                if job:
+                    job["got"], job["total"] = base + done, max(job["total"], base + total)
+                if self.clock() > self._until.get(key, 0):
+                    raise Abandoned("nobody waits for the voice")
+
+        try:
+            (self.dir / "models").mkdir(parents=True, exist_ok=True)
+            base = 0
+            if self.engine is None and not self._exe().exists():
+                asset = self._asset()
+                arc = self.dir / asset
+                say(f"voice: downloading the engine {asset}")
+                self.fetch(PIPER_REL + asset, arc, PIPER_MAX_BYTES, progress)
+                base = arc.stat().st_size
+                tmp = self.dir / "engine.tmp"
+                shutil.rmtree(tmp, ignore_errors=True)
+                if asset.endswith(".zip"):
+                    with zipfile.ZipFile(arc) as z:
+                        z.extractall(tmp)
+                else:
+                    with tarfile.open(arc) as t:
+                        t.extractall(tmp, filter="data")
+                shutil.rmtree(self.dir / "engine", ignore_errors=True)
+                os.replace(tmp, self.dir / "engine")
+                arc.unlink()
+                if sys.platform != "win32":
+                    self._exe().chmod(0o755)
+            path = urllib.parse.quote(voice_path(key))
+            cfg_dest = self._model(key).with_suffix(".onnx.json")
+            say(f"voice: downloading {key}")
+            self.fetch(VOICE_URL.format(rev=rev, path=path + ".onnx.json"), cfg_dest, 1048576)
+            cfg = fit_config(json.loads(cfg_dest.read_text(encoding="utf-8")))
+            cfg_dest.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+            model = self._model(key)
+            part = model.with_suffix(".dl")
+            self.fetch(VOICE_URL.format(rev=rev, path=path + ".onnx"), part, VOICE_MAX_BYTES,
+                       lambda d, t: progress(d, t, base))
+            os.replace(part, model)
+            with self._lock:
+                self._jobs.pop(key, None)
+            say(f"voice: {key} ready")
+        except Exception as e:  # noqa: BLE001 - whatever failed, the trip goes on without a voice
+            for p in (self.dir / "models").glob(key + ".*"):
+                if p.suffix in (".dl", ".part") or not self._model(key).exists():
+                    p.unlink(missing_ok=True)
+            for p in self.dir.glob("piper_*"):                       # a half-downloaded engine
+                p.unlink(missing_ok=True)
+            shutil.rmtree(self.dir / "engine.tmp", ignore_errors=True)
+            with self._lock:
+                self._jobs[key] = {"state": "failed", "error": str(e)[:120], "at": self.clock()}
+            say(f"voice: {key} failed: {e!r}")
+
+    def speak(self, lang, text, gong=True):
+        """(wav bytes, seconds, clip id) of a sentence; VoiceNotReady when the language's voice is not on this computer."""
+        st = self.status(lang)
+        if st["state"] != "ready":
+            raise VoiceNotReady(st["state"])
+        key, _, speaker = VOICES[lang]
+        text = str(text)[:SAY_MAX_CHARS]
+        cid = hashlib.sha1(f"{key}|{speaker}|{int(gong)}|{text}".encode("utf-8")).hexdigest()[:16]
+        clips = self.dir / "clips"
+        clip = clips / (cid + ".wav")
+        if clip.exists():
+            data = clip.read_bytes()
+            with wave.open(io.BytesIO(data), "rb") as w:
+                return data, round(w.getnframes() / w.getframerate(), 2), cid
+        clips.mkdir(parents=True, exist_ok=True)
+        if self.engine is not None:
+            speech = self.engine(self._model(key), text, speaker)
+        else:
+            raw = clips / (cid + ".raw.wav")
+            self._proc(key).speak(text, raw.resolve(), speaker)
+            speech = raw.read_bytes()
+            raw.unlink(missing_ok=True)
+        data, secs = with_chime(speech, gong)
+        clip.write_bytes(data)
+        self._writes += 1
+        if self._writes % 50 == 1:
+            self._trim(clips)
+        return data, secs, cid
+
+    def clip_path(self, cid):
+        return (self.dir / "clips" / (cid + ".wav")).resolve()
+
+    def _proc(self, key):
+        with self._lock:
+            p = self._procs.get(key)
+            if p is None or not p.alive():
+                p = PiperProc(self._exe(), self._model(key), self.clock)
+                self._procs[key] = p
+            if self._reaper is None:
+                self._reaper = threading.Thread(target=self._reap, daemon=True)
+                self._reaper.start()
+            return p
+
+    def _reap(self):
+        """Closes an engine nobody spoke through for IDLE_S; ends when none is left."""
+        while True:
+            time.sleep(5)
+            with self._lock:
+                for k, p in list(self._procs.items()):
+                    if not p.alive() or self.clock() - p.used > self.IDLE_S:
+                        p.close()
+                        del self._procs[k]
+                if not self._procs:
+                    self._reaper = None
+                    return
+
+    def close(self):
+        with self._lock:
+            for p in self._procs.values():
+                p.close()
+            self._procs.clear()
+
+    def _trim(self, clips):
+        files = sorted(clips.glob("*.wav"), key=lambda p: p.stat().st_mtime)
+        total = sum(p.stat().st_size for p in files)
+        while files and total > self.CLIPS_MAX_BYTES:
+            p = files.pop(0)
+            total -= p.stat().st_size
+            p.unlink(missing_ok=True)
+
+
 class Service:
     def __init__(self, cache, upstream=fetch_upstream, ttl=TTL_S, router=fetch_osrm, geocoder=geo_search, places=None, gtfs=None,
-                 db=None, live=False):
+                 db=None, live=False, voice=None):
         self.cache, self.upstream, self.ttl, self.router, self.geocoder = cache, upstream, ttl, router, geocoder
+        self.voice = voice or Announcer(None)       # the stop announcer's voices (none without a folder)
         self.db = db or RouteDb([])
         self.live = live                     # True: ignore the route database (fresh data from the map servers and timetables)
         self.places = places or Gazetteer(None)
@@ -2434,8 +3092,9 @@ class Service:
         return self.get(geo_key(q, lat, lon), (q, lat, lon), upstream=ask)
 
     def want_timetables(self, lat, lon):
-        """Start fetching the timetables of the countries round a point (once; in the background)."""
-        if not self.gtfs.enabled:
+        """Start fetching the timetables of the countries round a point (once; in the background). Not where the route
+        database answers: its lines have the timetables' times already."""
+        if not self.gtfs.enabled or self.db_covers(lat, lon):
             return
         if self.places.base:
             self.gtfs.want(self.places.countries_near(lat, lon))
@@ -2447,6 +3106,10 @@ class Service:
         self.places.want(lat, lon)
         self.want_timetables(lat, lon)
         elements = self.index.search(q, lat, lon)
+        if self.uses_db():
+            for e in self.db.named(q, lat, lon):
+                if not any(_dist_m(e["lat"], e["lon"], x["lat"], x["lon"]) < 60 for x in elements if x.get("lat") is not None):
+                    elements.append(e)
         if self.gtfs.ready():
             for row in self.gtfs.stops_named(q, lat, lon):
                 if not any(_dist_m(row[2], row[3], e["lat"], e["lon"]) < 60 for e in elements if e.get("lat") is not None):
@@ -2456,9 +3119,13 @@ class Service:
     MAP_SAME_M = 200          # stops of one name this near are one place on the map (its platforms)
     MAP_STATION_M = 150       # a stop this near a bus station of the map is that station
 
-    def map_stops(self, lat, lon, radius, limit=600):
+    def map_stops(self, lat, lon, radius, limit=600, src="auto"):
         """{"stops": [{id, name, lat, lon, kind, lines: [numbers]}]} round a point, from this computer only (the timetables and
         every stop this service has seen): bus stations first, then the stops with most lines; platforms of one stop are one."""
+        if self.uses_db(src):
+            got = self.db.map_places(lat, lon, radius)
+            if got is not None:                                # the route database has the place: its stops and lines only
+                return self.merge_map(got, lat, lon, limit, True)
         self.want_timetables(lat, lon)
         places = []                                            # [name, lat, lon, refs, kind]
         for name, la, lo, refs in (self.gtfs.stops_around(lat, lon, radius) if self.gtfs.ready() else []):
@@ -2483,6 +3150,10 @@ class Service:
         if not self.gtfs.ready():                              # no timetables here: the stops this service has seen
             for it in known:
                 places.append([it["name"], it["lat"], it["lon"], set(), "stop"])
+        return self.merge_map(places, lat, lon, limit, self.gtfs.ready())
+
+    def merge_map(self, places, lat, lon, limit, timetables):
+        """The map's answer of [name, lat, lon, refs, kind] places: platforms of one stop as one, bus stations first."""
         merged, by_name, stations = [], {}, []
         for pl in sorted(places, key=lambda x: (x[4] != "station", -len(x[3]))):
             key = fold(pl[0])
@@ -2503,11 +3174,18 @@ class Service:
             return (int(re.match(r"\d*", r).group() or 10 ** 6), r)
         out = [{"id": i + 1, "name": m[0], "lat": round(m[1], 6), "lon": round(m[2], 6), "kind": m[4],
                 "lines": sorted(m[3], key=by_number)[:24]} for i, m in enumerate(merged[:limit])]
-        return {"stops": out, "timetables": self.gtfs.ready()}
+        return {"stops": out, "timetables": timetables}
 
     def uses_db(self, src="auto"):
         """Does a request with this source choice read the route database?"""
         return self.db.enabled and (src == "db" or (src == "auto" and not self.live))
+
+    def db_covers(self, lat, lon, src="auto"):
+        """The route database answers for this place (nothing is asked of the live servers, no timetables are downloaded)."""
+        try:
+            return self.uses_db(src) and self.db.covers(lat, lon)
+        except (OSError, ValueError):
+            return False
 
     def nearby(self, lat, lon, offline=False, src="auto"):
         """(text, cached): the stops and lines around a point: OpenStreetMap's (kept per cell) with the timetables' lines
@@ -2563,8 +3241,15 @@ class Service:
             text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
         return text, cached
 
-    def lines(self, ref, lat, lon, local=False):
-        """(text, cached): the lines with this number: those the timetables know, then OpenStreetMap's."""
+    def lines(self, ref, lat, lon, local=False, src="auto"):
+        """(text, cached): the lines with this number: the route database's where it has the place (`local`: only its tiles on
+        this computer), else those the timetables know, then OpenStreetMap's."""
+        if self.uses_db(src):
+            text = self.db.lines_numbered(ref, lat, lon, online=not local)
+            if text is not None:
+                return text, True
+            if src == "db":
+                return '{"elements":[]}', True
         gt = self.gtfs.lines_numbered(ref, lat, lon) if self.gtfs.ready() else []
         if local:
             found = self.index.find_lines(ref, lat, lon)
@@ -2739,6 +3424,18 @@ class Service:
                 nodes.append(gtfs_node((x["sid"], x["name"], x["lat"], x["lon"], x["rowid"])))
         return json.dumps({"elements": [rel] + nodes}, separators=(",", ":"), ensure_ascii=False)
 
+    def stations(self, lat, lon, src="auto"):
+        """(text, cached): the bus stations round a point: the route database's where it has the place, else Overpass's."""
+        if self.uses_db(src):
+            text = self.db.stations(lat, lon)
+            if text is not None:
+                return text, True
+            if src == "db":
+                return '{"elements":[]}', True
+        c = STATIONS_CELL_DEG
+        slat, slon = round(round(lat / c) * c, 4), round(round(lon / c) * c, 4)
+        return self.get(stations_key(lat, lon), stations_query(slat, slon))
+
     def search(self, q, lat, lon):
         """(text, cached): the towns and stops on this computer first, the geocoder's (one request, ~1 s) after them; the
         slow map database only when neither knows the name."""
@@ -2753,6 +3450,8 @@ class Service:
                "places": merge_places(local["places"], geo.get("places") or []),
                "source": geo.get("source") or "local"}
         if not out["elements"] and not out["places"]:
+            if self.db_covers(lat, lon):                     # the database knows the place: a name it lacks is not worth 90 s of Overpass
+                return json.dumps(out, separators=(",", ":"), ensure_ascii=False), cached
             return self.get(search_key(q, lat, lon), search_query(q, lat, lon))
         return json.dumps(out, separators=(",", ":"), ensure_ascii=False), cached
 
@@ -2819,12 +3518,19 @@ class Service:
             say(f"path: {e}; straight lines instead")
             return straight_path(pts), False
 
-    def along(self, pts):
-        """(text, cached) of the stops near the road route; none while there is only a straight fallback."""
+    def along(self, pts, src="auto"):
+        """(text, cached) of the stops near the road route (the route database's where it has the places, else Overpass's);
+        none while there is only a straight fallback."""
         p, _ = self.path(pts)
         if p["source"] != "osrm":
             return '{"elements":[],"fallback":true}', False
         road = p["points"]
+        if self.uses_db(src):
+            text = self.db.along(road)
+            if text is not None:
+                return text, True
+            if src == "db":
+                return '{"elements":[]}', True
         return self.get(along_key(pts), along_query(road), post=lambda text: filter_along(text, road), upstream=self.upstream_once)
 
 
@@ -2841,7 +3547,8 @@ DEPOT_RADIUS_M = 10000
 DEPOT_CELL_DEG = 0.05
 FEATURES.extend(["shift", "depot"])
 FEATURES.append("routecached")
-FEATURES.extend(["source", "export"])        # ?src=auto|db|live on nearby and route (0.12); POST /v1/export (0.12)
+FEATURES.extend(["source", "export"])
+FEATURES.append("voice")          # /v1/voice (the voice of a country, downloaded while asked), /v1/say (a WAV): the stop announcer (0.13)        # ?src=auto|db|live on nearby and route (0.12); POST /v1/export (0.12)
 FEATURES.append("nearbycached")    # /v1/nearby?..&cached=1: from this computer only (0.10.3)      # /v1/route?id=..&cached=1: from this computer only (0.10.1)
 
 
@@ -3089,6 +3796,44 @@ def make_handler(service, port):
                         return self.fail(400, "lat / lon out of range")
                     text, cached = find_depot(service, lat, lon)
                     return self.send_json(200, b'{"ok":true,"cached":' + (b"true" if cached else b"false") + b',"data":' + text.encode("utf-8") + b"}")
+                if u.path in ("/v1/voice", "/v1/say"):
+                    lat = float(q["lat"][0]) if q.get("lat") else None
+                    lon = float(q["lon"][0]) if q.get("lon") else None
+                    lang = q.get("lang", [""])[0]
+                    if lang not in VOICES:
+                        cc = q.get("cc", [""])[0]
+                        if not cc and lat is not None and lon is not None and service.places.base:
+                            near = service.places.countries_near(lat, lon)
+                            cc = near[0] if near else ""
+                        lang = announce_lang(cc, lat, lon, q.get("ui", [""])[0])
+                    if u.path == "/v1/voice":
+                        return self.send_json(200, json.dumps({"ok": True, "data": service.voice.prepare(lang)}))
+                    if q.get("text"):
+                        text = q["text"][0]
+                    else:
+                        kind = q.get("kind", [""])[0]
+                        if kind not in SAY_KINDS or not q.get("name") or not lang:
+                            return self.fail(400, "kind / name / lang")
+                        text = announcement(lang, kind, q["name"][0], q.get("req", ["0"])[0] == "1")
+                    try:
+                        data, secs, cid = service.voice.speak(lang, text, q.get("gong", ["1"])[0] != "0")
+                    except VoiceNotReady as e:
+                        return self.fail(409, f"voice {e}")
+                    if q.get("file", ["0"])[0] == "1":      # the game and the service share this computer: the clip's path is enough
+                        return self.send_json(200, json.dumps({"ok": True, "data": {
+                            "path": str(service.voice.clip_path(cid)), "seconds": secs, "clip": cid, "lang": lang, "text": text}}, ensure_ascii=False))
+                    self.send_response(200)
+                    self.send_header("Content-Type", "audio/wav")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("X-Seconds", str(secs))
+                    self.send_header("X-Clip", cid)
+                    self.send_header("X-Lang", lang)
+                    self.send_header("X-Text", urllib.parse.quote(text))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return None
                 if u.path == "/v1/progress":
                     return self.send_json(200, json.dumps({"ok": True, "data": ACTIVITY.snapshot()}))
                 if u.path == "/v1/status":
@@ -3166,20 +3911,18 @@ def make_handler(service, port):
                 elif u.path == "/v1/along":
                     pts = parse_pts(q["pts"][0])
                     check_legs(pts)
-                    text, cached = service.along(pts)
+                    text, cached = service.along(pts, src=parse_src(q))
                 elif u.path == "/v1/stations":
                     lat, lon = float(q["lat"][0]), float(q["lon"][0])
                     if not (-85 <= lat <= 85 and -180 <= lon <= 180):
                         return self.fail(400, "lat / lon out of range")
-                    c = STATIONS_CELL_DEG
-                    slat, slon = round(round(lat / c) * c, 4), round(round(lon / c) * c, 4)
-                    text, cached = service.get(stations_key(lat, lon), stations_query(slat, slon))
+                    text, cached = service.stations(lat, lon, src=parse_src(q))
                 elif u.path == "/v1/mapstops":
                     lat, lon = float(q["lat"][0]), float(q["lon"][0])
                     r = min(30000.0, max(200.0, float(q.get("r", ["25000"])[0])))
                     if not (-85 <= lat <= 85 and -180 <= lon <= 180):
                         return self.fail(400, "lat / lon out of range")
-                    text, cached = json.dumps(service.map_stops(lat, lon, r), separators=(",", ":"), ensure_ascii=False), True
+                    text, cached = json.dumps(service.map_stops(lat, lon, r, src=parse_src(q)), separators=(",", ":"), ensure_ascii=False), True
                 elif u.path == "/v1/towns":
                     lat, lon = float(q["lat"][0]), float(q["lon"][0])
                     if not (-85 <= lat <= 85 and -180 <= lon <= 180):
@@ -3203,7 +3946,7 @@ def make_handler(service, port):
                     ref = clean_ref(q["ref"][0])
                     if ref is None:
                         return self.fail(400, "not a line number")
-                    text, cached = service.lines(ref, lat, lon, local=bool(q.get("local")))
+                    text, cached = service.lines(ref, lat, lon, local=bool(q.get("local")), src=parse_src(q))
                 else:
                     return self.fail(404, "unknown path")
             except (KeyError, IndexError, ValueError):
@@ -3231,7 +3974,8 @@ def serve(port=PORT, cache_dir=None, service=None):
         base = pathlib.Path(cache.dir).parent
         no_gtfs = os.environ.get("BNE_BUSDATA_GTFS") == "0"
         service = Service(cache, places=Gazetteer(base / "places"), gtfs=Gtfs(None if no_gtfs else base / "timetables"),
-                          db=RouteDb(db_repos_from_env(base)), live=os.environ.get("BNE_BUSDATA_LIVE") == "1")
+                          db=RouteDb(db_repos_from_env(base)), live=os.environ.get("BNE_BUSDATA_LIVE") == "1",
+                          voice=Announcer(None if os.environ.get("BNE_BUSDATA_VOICE") == "0" else base / "voice"))
     httpd = QuietServer(("127.0.0.1", port), make_handler(service, port))
     httpd.daemon_threads = True
     say(f"{APP} {VERSION} listening on 127.0.0.1:{port}, cache {service.cache.dir}")
