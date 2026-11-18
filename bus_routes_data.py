@@ -73,7 +73,7 @@ import wave
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.13.0"
+VERSION = "0.13.1"
 APP = "earth-bus-routes-data"
 PORT = 47630
 UA = f"{APP}/{VERSION} (+https://github.com/Robitnik/earth-bus-routes)"   # Overpass refuses clients without one
@@ -1095,7 +1095,7 @@ def road_samples(road, step=LIMIT_STEP_M, cap=LIMIT_SAMPLES):
 
 
 def road_limits(places, road):
-    """What the mod needs to know the speed limit where the map does not say: {"cc": "CZ", "towns": [[lat, lon, radius_m]]}
+    """What the mod needs to know the speed limit where the map does not say: {"cc": "CZ", "towns": [[lat, lon, radius_m, population]]}
     for the towns whose built-up area (town_radius) the road touches; the country is the nearest town's. None for no data."""
     if not places or len(road) < 2:
         return None
@@ -1126,7 +1126,7 @@ def road_limits(places, road):
         if nearest is None or best < nearest[0]:
             nearest = (best, p[6])
         if best <= town_radius(p[5]):
-            towns.append([round(p[2], 5), round(p[3], 5), town_radius(p[5])])
+            towns.append([round(p[2], 5), round(p[3], 5), town_radius(p[5]), int(p[5] or 0)])     # (the population: the passengers, 0.13.1)
     cc = nearest[1] if nearest and nearest[0] <= 10000 and nearest[1] else None
     return {"cc": cc, "towns": towns}
 
